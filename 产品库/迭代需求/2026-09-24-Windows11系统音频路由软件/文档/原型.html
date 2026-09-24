@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AudioRouter 原型</title>
+<style>
+  :root{
+    --bg:#f3f3f3; --card:#fbfbfb; --card-solid:#ffffff;
+    --line:#e5e5e5; --line-strong:#d6d6d6;
+    --text:#1b1b1b; --sub:#5d5d5d; --muted:#8a8a8a;
+    --accent:#0067c0; --accent-hover:#1975c5; --accent-light:#e5f1fb;
+    --ok:#0f7b0f; --ok-bg:#e7f2e7; --err:#c42b1c; --err-bg:#fdf3f2;
+  }
+  *{box-sizing:border-box; margin:0; padding:0;}
+  body{
+    font-family:"Segoe UI Variable","Segoe UI","Microsoft YaHei UI","Microsoft YaHei",system-ui,sans-serif;
+    background:var(--bg); color:var(--text);
+    display:flex; justify-content:center; padding:20px; min-height:100vh;
+    font-size:13px;
+  }
+  .app{width:100%; max-width:420px;}
+  .card{
+    background:var(--card); border:1px solid var(--line);
+    border-radius:8px; padding:14px 16px; margin-bottom:8px;
+  }
+  /* 标题栏 */
+  .titlebar{display:flex; align-items:center; gap:10px; padding:4px 4px 10px;}
+  .logo{width:26px;height:26px;border-radius:6px;background:var(--accent);
+    display:flex;align-items:center;justify-content:center;color:#fff;font-weight:600;font-size:11px;}
+  .titlebar b{font-size:14px;font-weight:600;}
+  .titlebar .state{margin-left:auto;font-size:12px;color:var(--sub);display:flex;align-items:center;gap:6px;}
+  .dot{width:7px;height:7px;border-radius:50%;}
+  .dot.ok{background:var(--ok);} .dot.err{background:var(--err);}
+  /* 总开关行 */
+  .master{display:flex;align-items:center;gap:12px;}
+  .master .lab{flex:1;}
+  .master .lab b{font-size:13px;font-weight:600;display:block;}
+  .master .lab span{font-size:11px;color:var(--sub);}
+  .switch{position:relative;width:40px;height:20px;border-radius:10px;background:transparent;
+    border:1px solid var(--line-strong);cursor:pointer;transition:.15s;flex-shrink:0;}
+  .switch::after{content:"";position:absolute;top:3px;left:3px;width:12px;height:12px;
+    border-radius:50%;background:var(--sub);transition:.15s;}
+  .switch[aria-checked="true"]{background:var(--accent);border-color:var(--accent);}
+  .switch[aria-checked="true"]::after{left:23px;background:#fff;}
+  .switch:hover{border-color:var(--sub);}
+  .switch[aria-checked="true"]:hover{background:var(--accent-hover);}
+  .switch:focus-visible{outline:2px solid var(--accent);outline-offset:2px;}
+  /* 下拉复选框 */
+  .fieldlab{font-size:11px;color:var(--sub);margin-bottom:5px;display:block;}
+  .dd{
+    position:relative; background:var(--card-solid); border:1px solid var(--line-strong);
+    border-radius:4px; font-size:13px;
+  }
+  .dd:hover{background:#f9f9f9;}
+  .dd-btn{
+    width:100%; display:flex; align-items:center; gap:8px; padding:7px 10px;
+    background:transparent; border:none; cursor:pointer; font:inherit; color:var(--text); text-align:left;
+  }
+  .dd-btn .txt{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .dd-btn .txt.placeholder{color:var(--muted);}
+  .dd-btn .chev{width:10px;height:10px;flex-shrink:0;}
+  .dd-panel{
+    display:none; position:absolute; left:-1px; right:-1px; top:calc(100% + 4px); z-index:5;
+    background:var(--card-solid); border:1px solid var(--line-strong); border-radius:4px;
+    box-shadow:0 4px 14px rgba(0,0,0,.12); overflow:hidden; max-height:210px; overflow-y:auto;
+  }
+  .dd.open .dd-panel{display:block;}
+  /* 复选框仅显示应用名 */
+  .dd-item{display:flex;align-items:center;gap:10px;padding:7px 10px;border-bottom:1px solid var(--line);cursor:pointer;}
+  .dd-item:last-child{border-bottom:none;}
+  .dd-item:hover{background:var(--accent-light);}
+  .dd-item .appname{flex:1;font-size:12.5px;}
+  .cb{
+    width:16px;height:16px;border-radius:3px;border:1px solid var(--line-strong);
+    flex-shrink:0;cursor:pointer;position:relative;background:#fff;
+  }
+  .cb[aria-checked="true"]{background:var(--accent);border-color:var(--accent);}
+  .cb[aria-checked="true"]::after{
+    content:"";position:absolute;left:4.5px;top:1.5px;width:4px;height:8px;
+    border:solid #fff;border-width:0 1.7px 1.7px 0;transform:rotate(40deg);
+  }
+  .cb:focus-visible{outline:2px solid var(--accent);outline-offset:1px;}
+  /* 已共享应用栏位（最多显示3行，溢出滚动） */
+  #selPanel{max-height:136px; overflow-y:auto;}
+  #selPanel::-webkit-scrollbar{width:8px;}
+  #selPanel::-webkit-scrollbar-thumb{background:#cfcfcf;border-radius:4px;border:2px solid var(--card);}
+  #selPanel::-webkit-scrollbar-thumb:hover{background:#b5b5b5;}
+  #selPanel::-webkit-scrollbar-track{background:transparent;}
+  .selrow{display:flex;align-items:center;gap:10px;padding:8px 2px;border-bottom:1px solid var(--line);}
+  .selrow{scroll-margin-top:4px;}
+  .selrow:last-child{border-bottom:none;}
+  .selrow .name{width:96px;flex-shrink:0;font-size:12.5px;font-weight:600;line-height:1.25;}
+  .selrow .name span{display:block;font-size:10px;color:var(--muted);font-weight:400;}
+  .srcmeter{width:56px;height:5px;border-radius:2px;background:#ececec;overflow:hidden;flex-shrink:0;}
+  .srcmeter i{display:block;height:100%;width:0;background:var(--accent);transition:width .15s;}
+  .volwrap{flex:1;display:flex;align-items:center;gap:7px;min-width:0;}
+  .volwrap input[type=range]{flex:1;accent-color:var(--accent);height:3px;cursor:pointer;}
+  .volwrap .pct{font-size:10.5px;color:var(--sub);width:31px;text-align:right;flex-shrink:0;}
+  .selempty{padding:14px 2px;font-size:11.5px;color:var(--muted);text-align:center;}
+  /* 麦克风下拉 */
+  select.mic{
+    width:100%; padding:7px 10px; font:inherit; color:var(--text);
+    background:var(--card-solid); border:1px solid var(--line-strong); border-radius:4px; cursor:pointer;
+  }
+  select.mic:hover{background:#f9f9f9;}
+  select.mic:focus-visible{outline:2px solid var(--accent);outline-offset:1px;}
+  /* 异常横幅 */
+  .banner{border-radius:6px;padding:8px 12px;font-size:12px;margin-bottom:8px;
+    display:none;align-items:center;gap:8px;border:1px solid transparent;}
+  .banner.show{display:flex;}
+  .banner.err{background:var(--err-bg);color:var(--err);border-color:#f0c7c3;}
+  .banner .btn-sm{margin-left:auto;}
+  .btn-sm{border:1px solid var(--accent);border-radius:4px;padding:4px 12px;font-size:11.5px;
+    cursor:pointer;background:var(--accent);color:#fff;font-family:inherit;}
+  .btn-sm:hover{background:var(--accent-hover);}
+  .btn-sm.ghost{background:transparent;color:var(--accent);}
+  .btn-sm.ghost:hover{background:var(--accent-light);}
+  .footnote{font-size:10.5px;color:var(--muted);line-height:1.7;padding:2px 6px;}
+  /* 引导弹窗 */
+  .overlay{position:fixed;inset:0;background:rgba(0,0,0,.32);display:none;
+    align-items:center;justify-content:center;padding:20px;z-index:20;}
+  .overlay.show{display:flex;}
+  .modal{background:#fff;border-radius:8px;max-width:460px;width:100%;
+    padding:22px 24px;box-shadow:0 16px 44px rgba(0,0,0,.22);}
+  .modal h2{font-size:15px;font-weight:600;margin-bottom:2px;}
+  .modal .sub{font-size:11.5px;color:var(--sub);margin-bottom:14px;}
+  .step{display:flex;gap:12px;padding:11px 0;border-top:1px solid var(--line);}
+  .step .num{width:22px;height:22px;border-radius:50%;background:#ececec;color:var(--sub);
+    display:flex;align-items:center;justify-content:center;font-size:11.5px;font-weight:600;flex-shrink:0;}
+  .step .num.done{background:var(--ok);color:#fff;}
+  .step .num.current{background:var(--accent);color:#fff;}
+  .step .c{flex:1;}
+  .step .c b{font-size:13px;display:block;}
+  .step .c p{font-size:11.5px;color:var(--sub);margin-top:3px;line-height:1.55;}
+  .step .act{align-self:center;}
+  .step .status{font-size:11.5px;align-self:center;}
+  .status.done{color:var(--ok);} .status.todo{color:var(--muted);}
+  .modal .modal-foot{display:flex;justify-content:flex-end;gap:8px;margin-top:16px;}
+  /* 演示控制 */
+  .demo{margin-top:14px;border:1px dashed #cfcfcf;border-radius:6px;padding:10px 12px;
+    font-size:11px;color:var(--sub);background:#ededed;}
+  .demo b{color:var(--text);}
+  .demo button{margin:4px 5px 0 0;}
+</style>
+</head>
+<body>
+<div class="app">
+
+  <div class="titlebar">
+    <div class="logo">AR</div>
+    <b>AudioRouter</b>
+    <span class="state"><span class="dot ok" id="devDot"></span><span id="devText">虚拟麦就绪</span></span>
+  </div>
+
+  <!-- 异常态横幅 -->
+  <div class="banner err" id="micBanner" role="alert">
+    <span>麦克风不可用：好友将听不到你的说话声（音乐共享不受影响）</span>
+  </div>
+  <div class="banner err" id="devBanner" role="alert">
+    <span>未检测到虚拟声卡，共享已停止</span>
+    <button class="btn-sm" onclick="openGuide()">开始安装</button>
+  </div>
+
+  <!-- 共享总开关（AC-03） -->
+  <div class="card master">
+    <div class="lab">
+      <b id="masterLab">开启共享</b>
+    </div>
+    <button class="switch" id="masterSwitch" role="switch" aria-checked="true"
+      aria-label="共享总开关" onclick="toggleMaster()"></button>
+  </div>
+
+  <!-- 应用下拉复选框（仅应用名 / AC-01） -->
+  <div class="card">
+    <label class="fieldlab" for="appDdBtn">要共享声音的应用（可多选）</label>
+    <div class="dd" id="appDd">
+      <button class="dd-btn" id="appDdBtn" aria-haspopup="listbox" aria-expanded="false"
+        onclick="toggleDd(event)">
+        <span class="txt" id="appDdTxt">网易云音乐、抖音</span>
+        <svg class="chev" viewBox="0 0 12 12"><path d="M2 4l4 4 4-4" stroke="#5d5d5d" stroke-width="1.4" fill="none" stroke-linecap="round"/></svg>
+      </button>
+      <div class="dd-panel" role="listbox" aria-label="具备扬声器权限的应用">
+        <div class="dd-item" data-app="cloudmusic" onclick="toggleSrc('cloudmusic')">
+          <button class="cb" role="checkbox" aria-checked="true" aria-label="共享网易云音乐"></button>
+          <span class="appname">网易云音乐</span>
+        </div>
+        <div class="dd-item" data-app="douyin" onclick="toggleSrc('douyin')">
+          <button class="cb" role="checkbox" aria-checked="true" aria-label="共享抖音"></button>
+          <span class="appname">抖音</span>
+        </div>
+        <div class="dd-item" data-app="chrome" onclick="toggleSrc('chrome')">
+          <button class="cb" role="checkbox" aria-checked="false" aria-label="共享 Chrome"></button>
+          <span class="appname">Chrome</span>
+        </div>
+        <div class="dd-item" data-app="qqmusic" onclick="toggleSrc('qqmusic')">
+          <button class="cb" role="checkbox" aria-checked="false" aria-label="共享 QQ音乐"></button>
+          <span class="appname">QQ音乐</span>
+        </div>
+        <div class="dd-item" data-app="steam" onclick="toggleSrc('steam')">
+          <button class="cb" role="checkbox" aria-checked="false" aria-label="共享 Steam"></button>
+          <span class="appname">Steam</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 已共享应用栏位（应用名+当前电平+音量滑块 / AC-02） -->
+    <div id="selPanel" style="margin-top:10px;" aria-label="已共享应用"></div>
+  </div>
+
+  <!-- 物理麦克风选择（AC-08） -->
+  <div class="card">
+    <label class="fieldlab" for="micSelect">你的麦克风（人声来源）</label>
+    <select class="mic" id="micSelect" aria-label="选择物理麦克风设备"
+      onchange="micChange(this)">
+      <option value="default" selected>系统默认麦克风</option>
+      <option value="usb">USB 麦克风 (Fifine K669)</option>
+      <option value="headset">耳机麦克风 (WH-1000XM5)</option>
+      <option value="array">笔记本内置麦克风阵列</option>
+    </select>
+  </div>
+
+  <div class="footnote">
+    音量只影响好友听到的声音，你本地听到的音量不变 · 聊天软件输入设备选「AudioRouter 虚拟麦」后无需再改
+  </div>
+
+  <!-- 演示控制（仅原型评审用） -->
+  <div class="demo">
+    <b>原型演示控制</b>（评审用）：
+    <button class="btn-sm ghost" onclick="showState('normal')">正常状态</button>
+    <button class="btn-sm ghost" onclick="showState('nomic')">异常：麦克风不可用</button>
+    <button class="btn-sm ghost" onclick="showState('nodev')">异常：虚拟声卡丢失</button>
+    <button class="btn-sm ghost" onclick="showState('appgone')">异常：网易云退出</button>
+    <button class="btn-sm ghost" onclick="openGuide()">首次配置引导</button>
+  </div>
+</div>
+
+<!-- 首次配置引导（AC-04） -->
+<div class="overlay" id="guideOverlay" role="dialog" aria-modal="true" aria-label="首次配置引导">
+  <div class="modal">
+    <h2>欢迎使用 AudioRouter</h2>
+    <p class="sub">三步完成配置，之后每天一键共享（目标：5 分钟内搞定）</p>
+    <div class="step" id="gStep1">
+      <div class="num current">1</div>
+      <div class="c"><b>安装虚拟声卡</b><p>约 1 分钟，需要管理员权限（UAC 弹窗请点"是"）。装完不用管它。</p></div>
+      <button class="btn-sm act" onclick="guideDone(1)">安装</button>
+    </div>
+    <div class="step" id="gStep2" style="opacity:.45;">
+      <div class="num">2</div>
+      <div class="c"><b>聊天软件里选输入设备</b><p>在微信 / QQ / 游戏语音的麦克风设置里，把输入设备选为「AudioRouter 虚拟麦」。选一次，以后不用再改。</p></div>
+      <span class="status todo">等待第 1 步</span>
+    </div>
+    <div class="step" id="gStep3" style="opacity:.45;">
+      <div class="num">3</div>
+      <div class="c"><b>完成</b><p>回到主界面，勾选想共享的应用，好友就能同时听到你说话和音乐了。</p></div>
+      <span class="status todo">等待第 2 步</span>
+    </div>
+    <div class="modal-foot">
+      <button class="btn-sm ghost" onclick="closeGuide()">稍后再说</button>
+      <button class="btn-sm" id="gFinish" style="opacity:.45;" disabled onclick="closeGuide()">开始使用</button>
+    </div>
+  </div>
+</div>
+
+<script>
+  var masterOn = true;
+  var gone = {}; // 演示：应用退出
+  var vols = {cloudmusic:80, douyin:45, chrome:80, qqmusic:80, steam:80};
+  var names = {cloudmusic:"网易云音乐", douyin:"抖音", chrome:"Chrome", qqmusic:"QQ音乐", steam:"Steam"};
+
+  // 下拉开合
+  function toggleDd(e){
+    e.stopPropagation();
+    var dd = document.getElementById('appDd');
+    var open = dd.classList.toggle('open');
+    document.getElementById('appDdBtn').setAttribute('aria-expanded', open);
+  }
+  document.addEventListener('click', function(e){
+    var dd = document.getElementById('appDd');
+    if(dd.classList.contains('open') && !dd.contains(e.target)){
+      dd.classList.remove('open');
+      document.getElementById('appDdBtn').setAttribute('aria-expanded', 'false');
+    }
+  });
+
+  // 勾选状态读取
+  function isSel(app){
+    var item = document.querySelector('.dd-item[data-app=' + app + ']');
+    return item && !gone[app] && item.querySelector('.cb').getAttribute('aria-checked') === 'true';
+  }
+
+  // 渲染已共享应用栏位
+  function renderSel(){
+    var panel = document.getElementById('selPanel');
+    var sel = Object.keys(names).filter(isSel);
+    if(!sel.length){
+      panel.innerHTML = '<div class="selempty">勾选上方应用开始共享</div>';
+    } else {
+      panel.innerHTML = sel.map(function(a){
+        return '<div class="selrow" data-sel="' + a + '">' +
+          '<div class="name">' + names[a] + '<span>' + a + '.exe</span></div>' +
+          '<div class="srcmeter"><i></i></div>' +
+          '<div class="volwrap">' +
+            '<input type="range" min="0" max="100" value="' + vols[a] + '" aria-label="' + names[a] + '共享音量" oninput="onVol(this, \'' + a + '\')">' +
+            '<span class="pct">' + vols[a] + '%</span>' +
+          '</div></div>';
+      }).join('');
+    }
+    // 下拉摘要
+    var txt = document.getElementById('appDdTxt');
+    txt.textContent = sel.length ? sel.map(function(a){return names[a];}).join('、') : '选择要共享的应用';
+    txt.classList.toggle('placeholder', sel.length === 0);
+  }
+
+  // 模拟电平（仅演示）：应用当前音频大小
+  setInterval(function(){
+    if(!masterOn) return;
+    document.querySelectorAll('.selrow').forEach(function(row){
+      row.querySelector('.srcmeter i').style.width = (25 + Math.random() * 65) + '%';
+    });
+  }, 400);
+
+  // 勾选/取消（AC-01）
+  function toggleSrc(app){
+    var cb = document.querySelector('.dd-item[data-app=' + app + '] .cb');
+    cb.setAttribute('aria-checked', cb.getAttribute('aria-checked') !== 'true');
+    if(gone[app]) gone[app] = false;
+    renderSel();
+  }
+
+  // 每源音量（AC-02）
+  function onVol(input, app){
+    vols[app] = input.value;
+    input.parentElement.querySelector('.pct').textContent = input.value + '%';
+  }
+
+  // 总开关（AC-03）
+  function toggleMaster(){
+    masterOn = !masterOn;
+    document.getElementById('masterSwitch').setAttribute('aria-checked', masterOn);
+    document.getElementById('masterLab').textContent = masterOn ? '开启共享' : '关闭共享';
+    if(!masterOn) document.querySelectorAll('.selrow .srcmeter i').forEach(function(i){i.style.width='0%';});
+  }
+
+  // 麦克风切换（AC-08）
+  function micChange(sel){
+    document.getElementById('micBanner').classList.remove('show');
+  }
+
+  // 异常态（演示）
+  function showState(s){
+    document.getElementById('micBanner').classList.toggle('show', s === 'nomic');
+    document.getElementById('devBanner').classList.toggle('show', s === 'nodev');
+    gone = (s === 'appgone') ? {cloudmusic:true} : {};
+    document.getElementById('devDot').className = 'dot ' + (s === 'nodev' ? 'err' : 'ok');
+    document.getElementById('devText').textContent = s === 'nodev' ? '虚拟麦不可用' : '虚拟麦就绪';
+    renderSel();
+  }
+
+  // 引导（AC-04）
+  function openGuide(){ document.getElementById('guideOverlay').classList.add('show'); }
+  function closeGuide(){ document.getElementById('guideOverlay').classList.remove('show'); }
+  function guideDone(n){
+    if(n === 1){
+      var s1 = document.getElementById('gStep1');
+      s1.querySelector('.num').className = 'num done';
+      s1.querySelector('.act').outerHTML = '<span class="status done">已安装 ✓</span>';
+      var s2 = document.getElementById('gStep2');
+      s2.style.opacity = '1';
+      s2.querySelector('.num').className = 'num current';
+      s2.querySelector('.status').outerHTML = '<button class="btn-sm act" onclick="guideDone(2)">我已选好</button>';
+    }
+    if(n === 2){
+      var s2b = document.getElementById('gStep2');
+      s2b.querySelector('.num').className = 'num done';
+      s2b.querySelector('.act').outerHTML = '<span class="status done">已选择 ✓</span>';
+      var s3 = document.getElementById('gStep3');
+      s3.style.opacity = '1';
+      s3.querySelector('.num').className = 'num current';
+      s3.querySelector('.status').outerHTML = '<span class="status done">可以开始了 ✓</span>';
+      var f = document.getElementById('gFinish');
+      f.disabled = false; f.style.opacity = '1';
+    }
+  }
+
+  renderSel();
+</script>
+</body>
+</html>
