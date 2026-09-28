@@ -2,19 +2,18 @@
 //! 追溯：TC-008（麦克风枚举）、TC-016（仅列具备扬声器权限的应用）、TC-006/011（CABLE 检测）
 
 use serde::Serialize;
-use windows::core::PCWSTR;
+use windows::core::{Interface, PCWSTR};
 use windows::Win32::Foundation::PROPERTYKEY;
+use windows::Win32::Media::Audio::Endpoints::IAudioMeterInformation;
 use windows::Win32::Media::Audio::{
-    eCapture, eCommunications, eRender, IMMDevice, IMMDeviceEnumerator, DEVICE_STATE_ACTIVE,
+    eCapture, eCommunications, eConsole, eRender, IAudioSessionControl2, IAudioSessionManager2,
+    IMMDevice, IMMDeviceEnumerator, DEVICE_STATE_ACTIVE,
 };
-use windows::Win32::System::Com::STGM;
-use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
-use windows::Win32::System::ProcessStatus::K32EnumProcesses;
+use windows::Win32::System::Com::{CLSCTX_ALL, STGM_READ};
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
-use windows::core::Interface;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct MicDevice {
@@ -28,6 +27,8 @@ pub struct AudioApp {
     pub pid: u32,
     pub exe: String,
     pub name: String,
+    /// 当前是否正在播放（会话峰值电平 > 阈值）
+    pub playing: bool,
 }
 
 /// VB-CABLE 的渲染端点设备名（写入端）
@@ -47,8 +48,20 @@ fn pwstr_to_string(ptr: PCWSTR) -> String {
     }
 }
 
+/// 确保当前线程已初始化 COM（WASAPI 必需；幂等）
+pub(crate) fn ensure_com() {
+    unsafe {
+        // COINIT_MULTITHREADED；已初始化(含其他模式)时忽略 S_FALSE/RPC_E_CHANGED_MODE
+        let _ = windows::Win32::System::Com::CoInitializeEx(
+            None,
+            windows::Win32::System::Com::COINIT_MULTITHREADED,
+        );
+    }
+}
+
 /// 创建设备枚举器（MMDeviceEnumerator CLSID）
 pub(crate) fn new_device_enumerator() -> windows::core::Result<IMMDeviceEnumerator> {
+    ensure_com();
     unsafe {
         let clsid = windows::core::GUID::from_u128(0xbcde0395_e52f_467c_8e3d_c4579291692e);
         windows::Win32::System::Com::CoCreateInstance(
@@ -61,7 +74,8 @@ pub(crate) fn new_device_enumerator() -> windows::core::Result<IMMDeviceEnumerat
 
 fn get_friendly_name(dev: &IMMDevice) -> windows::core::Result<String> {
     unsafe {
-        let store = dev.OpenPropertyStore(STGM(1) /* STGM_READ */)?;
+        // STGM_READ（=0）；误用 STGM_WRITE(1) 会导致 GetValue 返回 E_ACCESSDENIED
+        let store = dev.OpenPropertyStore(STGM_READ)?;
         let pk = PROPERTYKEY {
             fmtid: windows::core::GUID::from_u128(0xa45c254e_df1c_4efd_8020_67d146a850e0),
             pid: 14, // PKEY_Device_FriendlyName
@@ -82,6 +96,7 @@ fn get_friendly_name(dev: &IMMDevice) -> windows::core::Result<String> {
 /// 枚举物理麦克风（采集设备），并标记系统默认。
 /// 追溯 TC-008。
 pub fn list_capture_devices() -> Vec<MicDevice> {
+    ensure_com();
     unsafe {
         let Ok(enumerator) = new_device_enumerator() else {
             return Vec::new();
@@ -99,6 +114,11 @@ pub fn list_capture_devices() -> Vec<MicDevice> {
             for i in 0..collection.GetCount().unwrap_or(0) {
                 if let Ok(dev) = collection.Item(i) {
                     if let (Ok(id), Ok(name)) = (dev.GetId(), get_friendly_name(&dev)) {
+                        // 过滤 VB-CABLE 虚拟设备：其输出端被选为麦克风输入时，
+                        // 会与写入 "CABLE Input" 的混音形成回路自激（失真），直接从列表剔除
+                        if name.to_uppercase().contains("CABLE") {
+                            continue;
+                        }
                         let id_s = pwstr_to_string(PCWSTR(id.0));
                         out.push(MicDevice {
                             is_default: id_s == default_id,
@@ -116,6 +136,7 @@ pub fn list_capture_devices() -> Vec<MicDevice> {
 /// 检测 VB-CABLE 虚拟声卡是否已安装（检索渲染端点是否存在 "CABLE Input"）。
 /// 追溯 TC-006 / TC-011。
 pub fn detect_virtual_cable() -> bool {
+    ensure_com();
     unsafe {
         let Ok(enumerator) = new_device_enumerator() else {
             return false;
@@ -183,20 +204,29 @@ fn exe_display_name(exe: &str) -> String {
     exe.trim_end_matches(".exe").to_string()
 }
 
-/// 枚举所有进程，返回候选音频应用列表（过滤系统进程与 UWP）。
-/// 注：WASAPI Process Loopback 按 PID 激活，启动播放后即可捕获；
-/// 这里按可执行名聚合，过滤掉明显的系统/后台进程。
+/// 枚举音频会话，返回具备音频能力（创建过会话）的应用列表。
+/// 基于 IAudioSessionManager2 会话枚举（粒度1）：只有创建过音频会话的进程才出现，
+/// 天然排除无音频能力的进程；通过 IAudioMeterInformation::GetPeakValue 判定"正在播放"。
+/// 按 exe 归并（Chrome 多进程），playing 取任一会话。
 /// 追溯 TC-016。
 pub fn list_audio_apps() -> Vec<AudioApp> {
+    ensure_com();
     unsafe {
-        let mut pids = [0u32; 2048];
-        let mut needed = 0u32;
-        if !K32EnumProcesses(pids.as_mut_ptr(), pids.len() as u32, &mut needed).as_bool() {
+        let Ok(enumerator) = new_device_enumerator() else {
             return Vec::new();
-        }
-        let count = needed as usize / std::mem::size_of::<u32>();
+        };
+        // 默认渲染端点（控制台角色），音频会话挂在渲染设备上
+        let Ok(device) = enumerator.GetDefaultAudioEndpoint(eRender, eConsole) else {
+            return Vec::new();
+        };
+        let Ok(manager) = device.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None) else {
+            return Vec::new();
+        };
+        let Ok(sessions) = manager.GetSessionEnumerator() else {
+            return Vec::new();
+        };
 
-        // 过滤名单：系统进程与无 UI 的后台进程
+        // 过滤名单：系统进程、无 UI 的后台进程与本应用自身（写虚拟声卡的会话）
         const SYSTEM_EXES: &[&str] = &[
             "system", "registry", "smss.exe", "csrss.exe", "wininit.exe", "winlogon.exe",
             "services.exe", "lsass.exe", "svchost.exe", "fontdrvhost.exe", "dwm.exe",
@@ -209,33 +239,54 @@ pub fn list_audio_apps() -> Vec<AudioApp> {
             "python.exe", "pythonw.exe", "node.exe", "cargo.exe", "rustc.exe", "link.exe",
             "mspdbsrv.exe", "powershell.exe", "pwsh.exe", "cmd.exe", "bash.exe",
             "git.exe", "qwenwork.exe", "code.exe", "cursor.exe", "devenv.exe",
+            "audioshare.exe",
         ];
 
-        let mut seen = std::collections::HashSet::new();
-        let mut out = Vec::new();
-        for &pid in &pids[..count] {
+        // exe(小写) -> 聚合结果（同名多进程归并，playing 取 OR）
+        let mut seen: std::collections::HashMap<String, AudioApp> =
+            std::collections::HashMap::new();
+        for i in 0..sessions.GetCount().unwrap_or(0) {
+            let Ok(session) = sessions.GetSession(i) else { continue };
+            let Ok(ctrl2) = session.cast::<IAudioSessionControl2>() else { continue };
+            // 跳过系统声音会话（System Sounds）：S_OK 表示是，S_FALSE 表示不是
+            if ctrl2.IsSystemSoundsSession().0 == 0 {
+                continue;
+            }
+            let Ok(pid) = ctrl2.GetProcessId() else { continue };
             if pid == 0 {
                 continue;
             }
             let Some(exe) = process_name(pid) else { continue };
             let lower = exe.to_lowercase();
-            // UWP 包进程以 ApplicationFrameHost 之外难以直接 loopback，过滤已知 UWP 形态
             if lower.starts_with("application") {
                 continue;
             }
             if SYSTEM_EXES.iter().any(|s| lower == *s) {
                 continue;
             }
-            // 同名进程只展示一次（按可执行名聚合，Chrome 多进程归并）
-            if !seen.insert(lower.clone()) {
-                continue;
+            // 会话峰值电平：>0.0001 视为正在播放（每次枚举新建 meter，取近 3 秒峰值）
+            let playing = session
+                .cast::<IAudioMeterInformation>()
+                .ok()
+                .and_then(|m| m.GetPeakValue().ok())
+                .map(|p| p > 0.0001)
+                .unwrap_or(false);
+            match seen.get_mut(&lower) {
+                Some(app) => app.playing |= playing,
+                None => {
+                    seen.insert(
+                        lower.clone(),
+                        AudioApp {
+                            pid,
+                            exe,
+                            name: exe_display_name(&lower),
+                            playing,
+                        },
+                    );
+                }
             }
-            out.push(AudioApp {
-                pid,
-                exe,
-                name: exe_display_name(&lower),
-            });
         }
+        let mut out: Vec<AudioApp> = seen.into_values().collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
     }

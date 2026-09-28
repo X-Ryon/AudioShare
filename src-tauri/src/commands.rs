@@ -1,12 +1,15 @@
 //! Tauri 命令层与音频引擎编排（技术设计§4 commands.rs）
 //! 追溯：TC-001~TC-017
 //! 混音线程每 tick 短暂持锁拉取各源帧（rtrb 消费需要 &mut），命令层临界区极短，无阻塞风险。
+//! 阻塞式初始化（MicCapture/ProcessCapture）一律在锁外完成，避免持锁阻塞导致 UI 卡死。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
+use serde_json::json;
+use tauri::{AppHandle, Emitter, Manager};
+use tauri_plugin_store::StoreExt;
 
 use crate::audio::capture::ProcessCapture;
 use crate::audio::device_enum::{self, AudioApp, MicDevice};
@@ -79,21 +82,79 @@ impl Engine {
 
 static ENGINE: Mutex<Option<Engine>> = Mutex::new(None);
 
-pub fn init_engine(app: AppHandle) {
-    let mut eng = ENGINE.lock().unwrap();
-    if eng.is_none() {
-        let mut e = Engine::new();
-        // 启动时检测 CABLE，若在则启动混音链路（TC-006）
-        if device_enum::detect_virtual_cable() {
-            start_pipeline(&mut e, app);
-        }
-        *eng = Some(e);
+// ---------- 设置持久化（tauri-plugin-store）：onboarding 状态落盘 ----------
+const SETTINGS_FILE: &str = "settings.json";
+
+fn load_onboarding_done(app: &AppHandle) -> bool {
+    app.store(SETTINGS_FILE)
+        .ok()
+        .and_then(|s| s.get("onboarding_done"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+fn save_onboarding_done(app: &AppHandle) {
+    if let Ok(store) = app.store(SETTINGS_FILE) {
+        store.set("onboarding_done", json!(true));
+        let _ = store.save();
     }
 }
 
-/// 建立麦克风采集 + 混音线程 + 虚拟麦写出（技术设计§3 主流程）
-fn start_pipeline(e: &mut Engine, app: AppHandle) {
-    start_pipeline_locked(e, app);
+pub fn init_engine(app: AppHandle) {
+    let done = load_onboarding_done(&app);
+    {
+        let mut eng = ENGINE.lock().unwrap();
+        if eng.is_none() {
+            let mut e = Engine::new();
+            e.onboarding_done = done;
+            *eng = Some(e);
+        }
+    }
+    // 启动时检测 CABLE，若在则启动混音链路（TC-006）；锁外完成阻塞初始化
+    let _ = ensure_pipeline(app);
+}
+
+/// 确保混音管线运行（幂等）。阻塞式初始化在锁外完成，持锁区仅做状态插入。
+fn ensure_pipeline(app: AppHandle) -> Result<(), String> {
+    {
+        let eng = ENGINE.lock().unwrap();
+        if let Some(e) = eng.as_ref() {
+            if e.sink_running {
+                return Ok(());
+            }
+        }
+    }
+    if !device_enum::detect_virtual_cable() {
+        return Ok(()); // 无虚拟声卡时不启动（引导安装流程负责）
+    }
+    // 锁外创建麦克风采集（阻塞，上限 5s）
+    let mic_id = {
+        let eng = ENGINE.lock().unwrap();
+        eng.as_ref().map(|e| e.mic_id.clone()).unwrap_or_default()
+    };
+    let new_mic = MicCapture::new(&mic_id).ok();
+
+    let mut eng = ENGINE.lock().unwrap();
+    let Some(e) = eng.as_mut() else {
+        return Ok(());
+    };
+    if e.sink_running {
+        return Ok(());
+    }
+    if e.mic.is_none() {
+        if let Some((mic, consumer)) = new_mic {
+            e.mic = Some(mic);
+            e.mic_consumer = Some(consumer);
+        }
+    }
+    e.thread_stop = Arc::new(Mutex::new(false));
+    let stop = e.thread_stop.clone();
+    let thread = std::thread::Builder::new()
+        .name("mixer".into())
+        .spawn(move || mixer_loop_with_stop(app, stop));
+    e.thread = thread.ok();
+    e.sink_running = e.thread.is_some();
+    Ok(())
 }
 
 #[tauri::command]
@@ -128,18 +189,25 @@ pub fn get_status() -> AppStatus {
 }
 
 #[tauri::command]
-pub fn toggle_share(app: AppHandle, pid: u32, exe: String, enable: bool) -> Result<(), String> {
-    let mut eng = ENGINE.lock().unwrap();
-    let e = eng.as_mut().expect("engine not initialized");
+pub async fn toggle_share(app: AppHandle, pid: u32, exe: String, enable: bool) -> Result<(), String> {
     if enable {
-        if e.sources.contains_key(&pid) {
-            return Ok(());
+        {
+            let eng = ENGINE.lock().unwrap();
+            if let Some(e) = eng.as_ref() {
+                if e.sources.contains_key(&pid) {
+                    return Ok(());
+                }
+            }
         }
         // 首次共享时确保混音链路在跑（含 onboarding 后首次共享）
-        if !e.sink_running {
-            start_pipeline_locked(e, app.clone());
-        }
+        ensure_pipeline(app.clone())?;
+        // 锁外创建进程环回捕获（阻塞，上限 5s）
         let (capture, consumer) = ProcessCapture::new(pid).map_err(|err| err.to_string())?;
+        let mut eng = ENGINE.lock().unwrap();
+        let e = eng.as_mut().expect("engine not initialized");
+        if e.sources.contains_key(&pid) {
+            return Ok(()); // 并发重复勾选：新捕获随 drop 停止
+        }
         e.sources.insert(
             pid,
             SourceState {
@@ -153,6 +221,8 @@ pub fn toggle_share(app: AppHandle, pid: u32, exe: String, enable: bool) -> Resu
         e.volumes.insert(pid, 80); // 默认80%（PRD）
         e.gains.set_gain(pid, 0.8);
     } else {
+        let mut eng = ENGINE.lock().unwrap();
+        let e = eng.as_mut().expect("engine not initialized");
         if let Some(mut st) = e.sources.remove(&pid) {
             st.capture.stop();
         }
@@ -160,26 +230,6 @@ pub fn toggle_share(app: AppHandle, pid: u32, exe: String, enable: bool) -> Resu
         e.volumes.remove(&pid);
     }
     Ok(())
-}
-
-/// 在已持锁上下文中启动管线（start_pipeline 的锁内版本）
-fn start_pipeline_locked(e: &mut Engine, app: AppHandle) {
-    if e.sink_running || !device_enum::detect_virtual_cable() {
-        return;
-    }
-    if e.mic.is_none() {
-        if let Ok((mic, consumer)) = MicCapture::new(&e.mic_id) {
-            e.mic = Some(mic);
-            e.mic_consumer = Some(consumer);
-        }
-    }
-    e.thread_stop = Arc::new(Mutex::new(false));
-    let stop = e.thread_stop.clone();
-    let thread = std::thread::Builder::new()
-        .name("mixer".into())
-        .spawn(move || mixer_loop_with_stop(app, stop));
-    e.thread = thread.ok();
-    e.sink_running = true;
 }
 
 /// 带停止标志的混音循环
@@ -257,7 +307,7 @@ pub fn set_volume(pid: u32, volume: u8) {
 }
 
 #[tauri::command]
-pub fn set_mic(device_id: String) -> Result<(), String> {
+pub async fn set_mic(device_id: String) -> Result<(), String> {
     // TC-008：切换麦克风不断流——仅重建 MicCapture，应用源与写出不动
     let (mic, consumer) = MicCapture::new(&device_id).map_err(|e| e.to_string())?;
     let mut eng = ENGINE.lock().unwrap();
@@ -281,30 +331,118 @@ pub fn toggle_master(on: bool) {
 }
 
 #[tauri::command]
-pub fn finish_onboarding(app: AppHandle) {
-    let mut eng = ENGINE.lock().unwrap();
-    if let Some(e) = eng.as_mut() {
-        e.onboarding_done = true;
-        if !e.sink_running {
-            start_pipeline_locked(e, app);
+pub async fn finish_onboarding(app: AppHandle) {
+    // 持久化引导状态（修复：每次启动重复弹向导）
+    save_onboarding_done(&app);
+    {
+        let mut eng = ENGINE.lock().unwrap();
+        if let Some(e) = eng.as_mut() {
+            e.onboarding_done = true;
         }
     }
+    // 后台启动音频管线（MicCapture 初始化可能等待 5s，不阻塞前端）
+    let _ = std::thread::spawn(move || {
+        let _ = ensure_pipeline(app);
+    });
+}
+
+/// 自动安装 VB-CABLE（TC-011）：
+/// 已装→直接成功；未装→提权运行内置安装器（UAC 一次确认），等待完成后复检。
+/// 返回 (是否已装, 错误信息)。UAC 被拒绝时返回具体错误。
+#[tauri::command]
+pub async fn install_cable(app: AppHandle) -> Result<InstallResult, String> {
+    if device_enum::detect_virtual_cable() {
+        return Ok(InstallResult {
+            installed: true,
+            already: true,
+            message: "已安装".into(),
+        });
+    }
+
+    // 定位资源目录中的安装器（打包后为 resources/ 下；dev 回退源目录）
+    let resource = app
+        .path()
+        .resource_dir()
+        .ok()
+        .map(|d| d.join("resources/VBCABLE_Setup_x64.exe"))
+        .filter(|p| p.exists());
+    let exe = resource
+        .or_else(|| {
+            let fallback = std::path::PathBuf::from("src-tauri/resources/VBCABLE_Setup_x64.exe");
+            fallback.exists().then_some(fallback)
+        })
+        .ok_or("未找到内置安装器 VBCABLE_Setup_x64.exe")?;
+    run_installer(&exe).await
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InstallResult {
+    pub installed: bool,
+    pub already: bool,
+    pub message: String,
+}
+
+async fn run_installer(exe: &std::path::Path) -> Result<InstallResult, String> {
+    // VB-CABLE 安装器必须在 .inf 文件所在目录运行（否则报 "Missing inf file"）
+    // 安装器不支持静默模式（-h 无效），需用户在 GUI 中手动确认
+    // 安装后需要重启系统或音频服务才能检测设备
+    let exe_str = exe.to_string_lossy().replace('\'', "''");
+    let mut cmd = std::process::Command::new("powershell");
+    cmd.args([
+        "-NoProfile",
+        "-Command",
+        &format!(
+            "$exeDir = Split-Path -Parent '{exe_str}'; Start-Process -FilePath '{exe_str}' -WorkingDirectory $exeDir -Verb RunAs -Wait",
+        ),
+    ]);
+    let status = cmd
+        .status()
+        .map_err(|e| format!("启动安装器失败：{e}"))?;
+    if !status.success() {
+        return Err("安装器未完成（UAC 被取消或安装失败）".into());
+    }
+    // 安装后等待驱动设备就绪（VB-CABLE 官方要求重启，这里尝试等待 10 秒）
+    for _ in 0..20 {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        if device_enum::detect_virtual_cable() {
+            return Ok(InstallResult {
+                installed: true,
+                already: false,
+                message: "安装成功".into(),
+            });
+        }
+    }
+    // 10 秒内未检测到设备，但安装器已正常退出，提示用户重启
+    Ok(InstallResult {
+        installed: true,
+        already: false,
+        message: "安装完成，请重启系统后重新打开应用".into(),
+    })
+}
+
+#[tauri::command]
+pub fn get_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
 }
 
 #[tauri::command]
 pub fn quit_app(app: AppHandle) {
-    {
+    // 退出死锁修复：不能在持有 ENGINE 锁时 join 混音线程——
+    // 混音线程每 tick 需要短暂获取 ENGINE 锁，持锁 join 会互相等待导致卡死。
+    // 因此锁内仅移出引擎所有权（ENGINE 置 None），所有 stop/join 在锁外完成。
+    let engine = {
         let mut eng = ENGINE.lock().unwrap();
-        if let Some(e) = eng.as_mut() {
-            for (_, st) in e.sources.iter_mut() {
-                st.capture.stop();
-            }
-            e.sources.clear();
-            if let Some(mut m) = e.mic.take() {
-                m.stop();
-            }
-            e.stop_thread();
+        eng.take()
+    };
+    if let Some(mut e) = engine {
+        for (_, st) in e.sources.iter_mut() {
+            st.capture.stop();
         }
+        e.sources.clear();
+        if let Some(mut m) = e.mic.take() {
+            m.stop();
+        }
+        e.stop_thread();
     }
     app.exit(0);
 }
