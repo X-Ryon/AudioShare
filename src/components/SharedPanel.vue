@@ -32,13 +32,13 @@ function levelPct(pid: number): string {
 </template>
 
 <style scoped>
-#selPanel { max-height: 136px; overflow-y: auto; margin-top: 10px; }
+#selPanel { max-height: 136px; overflow-y: auto; margin-top: 8px; }
 #selPanel::-webkit-scrollbar { width: 8px; }
 #selPanel::-webkit-scrollbar-thumb { background: #cfcfcf; border-radius: 4px; border: 2px solid #fbfbfb; }
 #selPanel::-webkit-scrollbar-thumb:hover { background: #b5b5b5; }
 #selPanel::-webkit-scrollbar-track { background: transparent; }
-.selempty { padding: 14px 2px; font-size: 11.5px; color: #8a8a8a; text-align: center; }
-.selrow { display: flex; align-items: center; gap: 10px; padding: 8px 2px; border-bottom: 1px solid #e5e5e5; }
+.selempty { padding: 10px 2px; font-size: 11.5px; color: #8a8a8a; text-align: center; }
+.selrow { display: flex; align-items: center; gap: 10px; padding: 6px 2px; border-bottom: 1px solid #e5e5e5; }
 .selrow:last-child { border-bottom: none; }
 .selrow .name { width: 96px; flex-shrink: 0; font-size: 12.5px; font-weight: 600; line-height: 1.25; }
 .selrow .name span { display: block; font-size: 10px; color: #8a8a8a; font-weight: 400; }

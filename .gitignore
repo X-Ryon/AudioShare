@@ -22,3 +22,7 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+VBCABLE_Driver_Pack45/
+.fde/
+.qoder/

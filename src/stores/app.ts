@@ -7,7 +7,7 @@ import { reactive } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 
-export interface AudioApp { pid: number; exe: string; name: string }
+export interface AudioApp { pid: number; exe: string; name: string; playing: boolean }
 export interface MicDevice { id: string; name: string; is_default: boolean }
 export interface SharedInfo { pid: number; exe: string; volume: number }
 export interface AppStatus {
@@ -31,6 +31,7 @@ export const store = reactive({
   micId: '',
   micUnavailable: false,
   showOnboarding: false,
+  version: '',
 })
 
 async function refreshApps() {
@@ -66,6 +67,7 @@ async function refreshStatus() {
 export async function initStore() {
   await Promise.all([refreshApps(), refreshStatus()])
   await invoke('get_mics').then((m) => { store.mics = m as MicDevice[] })
+  await invoke<string>('get_version').then((v) => { store.version = v })
 
   // 应用列表每3秒刷新（PRD·应用音源枚举）
   setInterval(refreshApps, 3000)
@@ -89,6 +91,13 @@ export async function toggleShare(app: AudioApp, enable: boolean) {
     if (enable) store.selected.delete(app.pid)
     else store.selected.add(app.pid)
     throw err
+  }
+}
+
+export async function clearAllShared() {
+  const apps = store.apps.filter(a => store.selected.has(a.pid))
+  for (const app of apps) {
+    await toggleShare(app, false)
   }
 }
 

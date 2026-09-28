@@ -28,7 +28,7 @@ pub fn run() {
             let menu = Menu::with_items(app, &[&show, &quit])?;
             let _tray = TrayIconBuilder::with_id("main-tray")
                 .icon(app.default_window_icon().unwrap().clone())
-                .tooltip("AudioRouter")
+                .tooltip("AudioShare")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| {
@@ -76,6 +76,8 @@ pub fn run() {
             commands::set_mic,
             commands::toggle_master,
             commands::finish_onboarding,
+            commands::install_cable,
+            commands::get_version,
             commands::quit_app
         ])
         .run(tauri::generate_context!())

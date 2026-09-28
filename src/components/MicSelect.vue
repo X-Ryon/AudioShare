@@ -6,7 +6,7 @@ import { store, setMic } from '../stores/app'
 </script>
 
 <template>
-  <label class="fieldlab" for="micSelect">你的麦克风（人声来源）</label>
+  <label class="fieldlab" for="micSelect">麦克风</label>
   <select id="micSelect" class="mic" aria-label="选择物理麦克风设备"
     :value="store.micId" @change="(e) => setMic((e.target as HTMLSelectElement).value)">
     <option value="">系统默认麦克风</option>
