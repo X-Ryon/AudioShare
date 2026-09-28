@@ -81,7 +81,7 @@ AudioShare/
 │   │   └── main.rs
 │   ├── resources/          # 打包附带的 VB-CABLE 安装器
 │   └── tauri.conf.json
-├── VBCABLE_Driver_Pack45/  # VB-CABLE 驱动包（安装器 + inf/sys）
+├── VBCABLE_Driver_Pack45/  # VB-CABLE 驱动包（安装器 + inf/sys，release安装包内自带，源码运行需自行从官网下载，然后解压到项目根目录）
 ├── 产品库/迭代需求/…/文档/  # PRD / 技术设计 / 测试用例 / 目标
 └── package.json
 ```
