@@ -1,11 +1,10 @@
 <script setup lang="ts">
 /**
- * 主窗口：组合全部组件（对应原型 v5）
+ * 主窗口：组合全部组件（对应原型 v6）
  */
 import { onMounted } from 'vue'
 import { store, initStore, toggleMaster, quitApp } from '../stores/app'
-import AppDropdown from '../components/AppDropdown.vue'
-import SharedPanel from '../components/SharedPanel.vue'
+import AppList from '../components/AppList.vue'
 import MicSelect from '../components/MicSelect.vue'
 import Onboarding from '../components/Onboarding.vue'
 
@@ -21,16 +20,16 @@ onMounted(async () => {
       <button class="wizard-btn" @click="store.showOnboarding = true">配置向导</button>
       <span class="state">
         <span class="dot" :class="store.cableInstalled ? 'ok' : 'err'" />
-        <span>{{ store.cableInstalled ? '虚拟麦就绪' : '虚拟麦不可用' }}</span>
+        <span>{{ store.cableInstalled ? '虚拟麦克风就绪' : '虚拟麦克风不可用' }}</span>
       </span>
     </div>
 
     <!-- 异常横幅（PRD·异常场景） -->
     <div v-if="store.micUnavailable" class="banner err" role="alert">
-      麦克风不可用：好友将听不到你的说话声（音乐共享不受影响）
+      麦克风不可用
     </div>
     <div v-if="!store.cableInstalled" class="banner err" role="alert">
-      未检测到虚拟声卡，共享已停止
+      未检测到虚拟声卡
       <button class="btn-sm" @click="store.showOnboarding = true">开始安装</button>
     </div>
 
@@ -41,10 +40,10 @@ onMounted(async () => {
         aria-label="共享总开关" @click="toggleMaster(!store.masterOn)" />
     </div>
 
-    <!-- 应用下拉 + 已共享栏位 -->
+    <!-- 应用列表（含所有音频会话程序） -->
     <div class="card">
-      <AppDropdown />
-      <SharedPanel />
+      <label class="fieldlab">应用列表</label>
+      <AppList />
     </div>
 
     <!-- 物理麦克风 -->
@@ -102,4 +101,5 @@ body { overflow: hidden; }
 .footnote { font-size: 10.5px; color: #8a8a8a; line-height: 1.6; padding: 1px 2px; flex-shrink: 0; }
 .footnote.quit { margin-top: auto; }
 .footnote a { color: #8a8a8a; }
+.fieldlab { font-size: 11px; color: #5d5d5d; margin-bottom: 5px; display: block; }
 </style>

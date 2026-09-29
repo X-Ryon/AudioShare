@@ -177,6 +177,7 @@ impl ProcessCapture {
             }
             Err(_) => {
                 // 初始化挂起/线程退出未回传：置停止标志防止线程泄漏
+                log::error!(target: "capture", "pid={pid} 捕获初始化超时（>5s）");
                 *stop_flag.lock().unwrap() = true;
                 Err(windows::core::Error::from(windows::core::HRESULT(
                     0x80004005u32 as i32,
@@ -260,6 +261,7 @@ fn capture_thread(pid: u32, stop: Arc<Mutex<bool>>, tx: mpsc::Sender<SetupResult
                 if diag {
                     eprintln!("[cap-{pid}] init FAIL {e:?}");
                 }
+                log::error!(target: "capture", "pid={pid} 捕获初始化失败: {e:?}");
                 let _ = tx.send(Err(e));
                 return;
             }

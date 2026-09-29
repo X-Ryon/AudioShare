@@ -157,6 +157,24 @@ pub fn detect_virtual_cable() -> bool {
     }
 }
 
+/// 检测系统默认输入设备（控制台角色）是否为 VB-CABLE。
+/// 引导第 2 步轮询用：默认麦克风必须设为 CABLE Input，会议软件才能收到共享音频。
+pub fn default_mic_is_cable() -> bool {
+    ensure_com();
+    unsafe {
+        let Ok(enumerator) = new_device_enumerator() else {
+            return false;
+        };
+        let Ok(dev) = enumerator.GetDefaultAudioEndpoint(eCapture, eConsole) else {
+            return false; // 无任何采集设备
+        };
+        let Ok(name) = get_friendly_name(&dev) else {
+            return false;
+        };
+        name.to_uppercase().contains("CABLE")
+    }
+}
+
 fn process_name(pid: u32) -> Option<String> {
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
