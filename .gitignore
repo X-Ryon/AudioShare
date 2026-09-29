@@ -28,3 +28,6 @@ VBCABLE_Driver_Pack45/
 .qoder/
 产品库/
 openspec/
+
+# 签名私钥（严禁提交）
+.signer

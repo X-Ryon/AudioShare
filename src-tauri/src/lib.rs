@@ -13,6 +13,7 @@ pub mod logging;
 use tauri::Manager;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{TrayIconBuilder, TrayIconEvent};
+use tauri::Emitter;
 
 /// 统一数据目录名：%APPDATA%\AudioShare（与 identifier 解耦，remember/settings/logs 均存于此）
 pub const DATA_DIR_NAME: &str = "AudioShare";
@@ -43,6 +44,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_store::Builder::new().build())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             // 日志体系先行：后续所有异常（含引擎初始化）均可落盘
             migrate_legacy_data_dir(app.handle());
@@ -56,10 +58,11 @@ pub fn run() {
             // 初始化全局音频引擎状态
             commands::init_engine(app.handle().clone());
 
-            // 托盘常驻（PRD·托盘常驻）：双击恢复窗口，菜单可退出
+            // 托盘常驻（PRD·托盘常驻）：双击恢复窗口，菜单可退出、检查更新
             let show = MenuItem::with_id(app, "show", "打开主界面", true, None::<&str>)?;
+            let check_update = MenuItem::with_id(app, "check_update", "检查更新", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show, &quit])?;
+            let menu = Menu::with_items(app, &[&show, &check_update, &quit])?;
             let _tray = TrayIconBuilder::with_id("main-tray")
                 .icon(app.default_window_icon().unwrap().clone())
                 .tooltip("AudioShare")
@@ -73,8 +76,11 @@ pub fn run() {
                                 let _ = w.set_focus();
                             }
                         }
+                        "check_update" => {
+                            // 通知前端执行更新检查
+                            let _ = app.emit("tray-check-update", ());
+                        }
                         "quit" => {
-                            use tauri::Emitter;
                             let _ = app.emit("tray-quit", ());
                             commands::quit_app(app.clone());
                         }
