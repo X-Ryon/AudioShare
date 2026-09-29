@@ -72,8 +72,8 @@ html, body, #app {
 }
 html, body, #app { height: 100%; }
 /* 仅"已勾选应用"列表允许滚动，其余容器禁止滚动 */
-body { display: flex; justify-content: center; padding: 12px 14px; overflow: hidden; }
-.app { width: 100%; max-width: 400px; margin: 0 auto; display: flex; flex-direction: column; height: 100%; }
+body { overflow: hidden; }
+.app { width: 100%; max-width: 400px; margin: 0 auto; display: flex; flex-direction: column; height: 100%; padding: 12px 14px; }
 .footnote.quit { margin-top: auto; padding-bottom: 0; display: flex; justify-content: space-between; align-items: center; }
 .footnote .ver { color: #b3b3b3; font-size: 10px; }
 .card { background: #fbfbfb; border: 1px solid #e5e5e5; border-radius: 8px; padding: 10px 12px; margin-bottom: 6px; flex-shrink: 0; }
