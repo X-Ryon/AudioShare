@@ -2,15 +2,55 @@
 /**
  * 主窗口：组合全部组件（对应原型 v6）
  */
-import { onMounted } from 'vue'
+import { onMounted, ref } from 'vue'
+import { listen } from '@tauri-apps/api/event'
+import { check } from '@tauri-apps/plugin-updater'
 import { store, initStore, toggleMaster, quitApp } from '../stores/app'
 import AppList from '../components/AppList.vue'
 import MicSelect from '../components/MicSelect.vue'
 import Onboarding from '../components/Onboarding.vue'
 
+// 更新状态
+const updateStatus = ref<'idle' | 'checking' | 'available' | 'downloading' | 'installing' | 'latest' | 'error'>('idle')
+const updateInfo = ref({ version: '', body: '' })
+const updateProgress = ref(0)
+const updateError = ref('')
+
+/** 检查并安装更新 */
+async function doCheckUpdate() {
+  updateStatus.value = 'checking'
+  updateError.value = ''
+  try {
+    const update = await check()
+    if (!update) {
+      updateStatus.value = 'latest'
+      return
+    }
+    updateInfo.value = { version: update.version, body: update.body || '' }
+    updateStatus.value = 'available'
+    // 自动下载并安装
+    updateStatus.value = 'downloading'
+    await update.downloadAndInstall((event) => {
+      if (event.event === 'Progress') {
+        // Progress 事件只有 chunkLength，无总大小，用累计字节数近似显示
+        updateProgress.value = Math.min(99, updateProgress.value + 5)
+      } else if (event.event === 'Finished') {
+        updateStatus.value = 'installing'
+      }
+    })
+    // 安装完成后应用会重启
+  } catch (e: any) {
+    updateStatus.value = 'error'
+    updateError.value = e?.message || String(e)
+  }
+}
+
 onMounted(async () => {
   await initStore()
   store.showOnboarding = !store.onboardingDone || !store.cableInstalled
+
+  // 监听托盘“检查更新”事件
+  await listen('tray-check-update', () => { doCheckUpdate() })
 })
 </script>
 
@@ -59,6 +99,16 @@ onMounted(async () => {
     </div>
 
     <Onboarding v-if="store.showOnboarding" @close="store.showOnboarding = false" />
+
+    <!-- 更新状态提示 -->
+    <div v-if="updateStatus !== 'idle'" class="update-toast">
+      <template v-if="updateStatus === 'checking'">🔍 正在检查更新…</template>
+      <template v-else-if="updateStatus === 'latest'">✅ 已是最新版本</template>
+      <template v-else-if="updateStatus === 'available'">📦 发现新版本 v{{ updateInfo.version }}，正在下载…</template>
+      <template v-else-if="updateStatus === 'downloading'">⬇️ 下载中 {{ updateProgress }}%</template>
+      <template v-else-if="updateStatus === 'installing'">⚙️ 安装中，即将重启…</template>
+      <template v-else-if="updateStatus === 'error'">❌ 更新失败：{{ updateError }}</template>
+    </div>
   </div>
 </template>
 
@@ -102,4 +152,5 @@ body { overflow: hidden; }
 .footnote.quit { margin-top: auto; }
 .footnote a { color: #8a8a8a; }
 .fieldlab { font-size: 11px; color: #5d5d5d; margin-bottom: 5px; display: block; }
+.update-toast { position: fixed; bottom: 40px; left: 50%; transform: translateX(-50%); background: #1b1b1b; color: #fff; padding: 8px 16px; border-radius: 6px; font-size: 12px; white-space: nowrap; z-index: 100; box-shadow: 0 2px 8px rgba(0,0,0,.2); }
 </style>
