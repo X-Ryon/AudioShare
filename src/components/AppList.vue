@@ -1,13 +1,42 @@
 <script setup lang="ts">
 /**
- * 应用列表：直接显示所有有音频会话的程序，每行含状态/名称/电平/音量/共享开关
+ * 应用列表：直接显示所有有音频会话的程序，每行含状态/图标/名称/电平/音量/共享开关
  * 替代原 AppDropdown + SharedPanel 组合
  */
-import { computed } from 'vue'
+import { computed, reactive, onMounted, watch } from 'vue'
 import { store, toggleShare, setVolume } from '../stores/app'
+import { invoke } from '@tauri-apps/api/core'
 import MarqueeText from './MarqueeText.vue'
 
 const rows = computed(() => store.apps)
+
+// 图标缓存：pid -> base64 data URL
+const icons = reactive<Record<number, string>>({})
+
+/** 延迟加载应用图标（仅首次请求时调用后端提取） */
+async function loadIcon(pid: number, exe: string) {
+  if (icons[pid]) return // 已加载
+  try {
+    const icon = await invoke<string | null>('get_app_icon', { pid })
+    if (icon) icons[pid] = icon
+  } catch (e) {
+    console.warn('Failed to load icon for', exe, e)
+  }
+}
+
+onMounted(() => {
+  // 初始加载所有应用图标
+  for (const app of store.apps) {
+    loadIcon(app.pid, app.exe)
+  }
+})
+
+// 监听应用列表变化，自动加载新应用图标
+watch(() => store.apps, (apps) => {
+  for (const app of apps) {
+    if (!icons[app.pid]) loadIcon(app.pid, app.exe)
+  }
+}, { immediate: true, deep: true })
 
 /** RMS(0-1) → 电平条宽度百分比（平方根曲线放大低值） */
 function levelPct(pid: number): string {
@@ -20,9 +49,11 @@ function levelPct(pid: number): string {
   <div class="app-list">
     <div v-if="!rows.length" class="empty">暂无可用应用…</div>
     <div v-for="app in rows" :key="app.pid" class="row">
-      <!-- 左列：状态点 + 名称 + 电平条 -->
+      <!-- 左列：状态点 + 图标 + 名称 + 电平条 -->
       <div class="left">
         <span class="dot" :class="{ playing: app.playing }" :title="app.playing ? '正在播放' : '未播放'" />
+        <img v-if="icons[app.pid]" :src="icons[app.pid]" class="app-icon" :alt="app.name" />
+        <div v-else class="app-icon placeholder" />
         <div class="info">
           <MarqueeText class="name" :text="app.name" />
           <div class="meter"><i :style="{ width: levelPct(app.pid) }" /></div>
@@ -45,7 +76,7 @@ function levelPct(pid: number): string {
 </template>
 
 <style scoped>
-.app-list { max-height: 180px; overflow-y: auto; overflow-x: hidden; }
+.app-list { max-height: 160px; overflow-y: auto; overflow-x: hidden; }
 .app-list::-webkit-scrollbar { width: 8px; }
 .app-list::-webkit-scrollbar-thumb { background: #cfcfcf; border-radius: 4px; border: 2px solid #fbfbfb; }
 .app-list::-webkit-scrollbar-thumb:hover { background: #b5b5b5; }
@@ -56,6 +87,8 @@ function levelPct(pid: number): string {
 .left { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: #d32f2f; flex-shrink: 0; }
 .dot.playing { background: #2e7d32; }
+.app-icon { width: 18px; height: 18px; border-radius: 3px; flex-shrink: 0; object-fit: contain; }
+.app-icon.placeholder { background: #e0e0e0; }
 .info { flex: 1; min-width: 0; }
 .name { font-size: 12.5px; font-weight: 500; line-height: 1.3; }
 .meter { width: 50%; height: 4px; border-radius: 2px; background: #ececec; overflow: hidden; margin-top: 4px; }

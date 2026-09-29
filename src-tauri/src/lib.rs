@@ -116,6 +116,7 @@ pub fn run() {
             commands::set_remember,
             commands::write_log,
             commands::get_version,
+            commands::get_app_icon,
             commands::quit_app
         ])
         .run(tauri::generate_context!())

@@ -1,6 +1,6 @@
 [package]
 name = "audioshare"
-version = "0.5.0"
+version = "0.6.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -41,7 +41,12 @@ windows = { version = "0.62", features = [
   "Win32_System_SystemServices",
   "Win32_Security",
   "Win32_UI_Shell_PropertiesSystem",
+  "Win32_UI_Shell",
+  "Win32_Graphics_Gdi",
+  "Win32_UI_WindowsAndMessaging",
 ] }
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
