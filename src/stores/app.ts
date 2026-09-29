@@ -10,6 +10,8 @@ import { listen } from '@tauri-apps/api/event'
 export interface AudioApp { pid: number; exe: string; name: string; playing: boolean }
 export interface MicDevice { id: string; name: string; is_default: boolean }
 export interface SharedInfo { pid: number; exe: string; volume: number }
+// 记忆配置：总开关状态 + 麦克风设备 id
+export interface RememberConfig { enabled: boolean; master_on: boolean; mic: string }
 export interface AppStatus {
   cable_installed: boolean
   master_on: boolean
@@ -25,17 +27,31 @@ export const store = reactive({
   selected: new Set<number>(),      // 已勾选 pid
   volumes: {} as Record<number, number>, // pid -> 0-100
   levels: {} as Record<number, number>,  // pid -> rms 0-1
-  masterOn: true,
+  micLevel: 0,                              // 麦克风实时 RMS 0-1
+  masterOn: false,                          // 初始化为关闭
   cableInstalled: false,
   onboardingDone: false,
   micId: '',
   micUnavailable: false,
   showOnboarding: false,
   version: '',
+  rememberOn: false,                  // 记住选择开关
 })
 
+/** 前端日志通道：异常经后端 write_log 落盘（与后端日志同文件） */
+export function logFrontend(level: 'error' | 'warn' | 'info', message: string) {
+  invoke('write_log', { level, message }).catch(() => {})
+}
+
 async function refreshApps() {
-  store.apps = await invoke<AudioApp[]>('get_apps')
+  let apps: AudioApp[]
+  try {
+    apps = await invoke<AudioApp[]>('get_apps')
+  } catch (err) {
+    logFrontend('warn', `get_apps 失败: ${err}`)
+    return
+  }
+  store.apps = apps
   // 移除已不存在的勾选（应用退出，TC-007）
   const pids = new Set(store.apps.map(a => a.pid))
   for (const pid of [...store.selected]) {
@@ -65,6 +81,12 @@ async function refreshStatus() {
 }
 
 export async function initStore() {
+  // 记住选择配置加载
+  await invoke<RememberConfig>('get_remember')
+    .then((rc) => {
+      store.rememberOn = rc.enabled
+    })
+    .catch((err) => logFrontend('warn', `记住配置加载失败: ${err}`))
   await Promise.all([refreshApps(), refreshStatus()])
   await invoke('get_mics').then((m) => { store.mics = m as MicDevice[] })
   await invoke<string>('get_version').then((v) => { store.version = v })
@@ -78,6 +100,11 @@ export async function initStore() {
       store.levels[pid] = rms
     }
   })
+
+  // 麦克风实时电平
+  await listen<number>('mic_level', (e) => {
+    store.micLevel = e.payload
+  })
 }
 
 export async function toggleShare(app: AudioApp, enable: boolean) {
@@ -87,17 +114,11 @@ export async function toggleShare(app: AudioApp, enable: boolean) {
     await invoke('toggle_share', { pid: app.pid, exe: app.exe, enable })
     if (enable && !(app.pid in store.volumes)) store.volumes[app.pid] = 80
   } catch (err) {
+    logFrontend('error', `toggle_share 失败 ${app.exe} enable=${enable}: ${err}`)
     // 失败回滚
     if (enable) store.selected.delete(app.pid)
     else store.selected.add(app.pid)
     throw err
-  }
-}
-
-export async function clearAllShared() {
-  const apps = store.apps.filter(a => store.selected.has(a.pid))
-  for (const app of apps) {
-    await toggleShare(app, false)
   }
 }
 
@@ -111,9 +132,15 @@ export async function setMic(id: string) {
   store.micUnavailable = false
   try {
     await invoke('set_mic', { deviceId: id })
-  } catch {
+  } catch (err) {
+    logFrontend('error', `set_mic 失败: ${id}: ${err}`)
     store.micUnavailable = true // TC-012 横幅
   }
+}
+
+export async function setRemember(on: boolean) {
+  store.rememberOn = on
+  await invoke('set_remember', { on })
 }
 
 export async function toggleMaster(on: boolean) {

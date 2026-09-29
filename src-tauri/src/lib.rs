@@ -8,10 +8,35 @@ fn greet(name: &str) -> String {
 
 pub mod audio;
 pub mod commands;
+pub mod logging;
 
 use tauri::Manager;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{TrayIconBuilder, TrayIconEvent};
+
+/// 统一数据目录名：%APPDATA%\AudioShare（与 identifier 解耦，remember/settings/logs 均存于此）
+pub const DATA_DIR_NAME: &str = "AudioShare";
+
+/// 应用数据目录（不随 identifier 变化）
+pub fn data_dir<R: tauri::Runtime>(m: &impl Manager<R>) -> Option<std::path::PathBuf> {
+    m.path().config_dir().ok().map(|d| d.join(DATA_DIR_NAME))
+}
+
+/// 一次性迁移：旧版数据目录（随 identifier 命名）整体重命名为新目录，保留用户配置与日志
+fn migrate_legacy_data_dir<R: tauri::Runtime>(m: &impl Manager<R>) {
+    let Ok(cfg) = m.path().config_dir() else { return };
+    let new_dir = cfg.join(DATA_DIR_NAME);
+    if new_dir.exists() {
+        return;
+    }
+    for legacy in ["com.xuhaoliang.audioshare", "com.xryon.audioshare"] {
+        let old = cfg.join(legacy);
+        if old.exists() {
+            let _ = std::fs::rename(&old, &new_dir);
+            break;
+        }
+    }
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -19,6 +44,15 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_store::Builder::new().build())
         .setup(|app| {
+            // 日志体系先行：后续所有异常（含引擎初始化）均可落盘
+            migrate_legacy_data_dir(app.handle());
+            if let Some(dir) = data_dir(app.handle()) {
+                if let Err(e) = logging::init(&dir) {
+                    eprintln!("日志初始化失败，降级为无日志运行: {e}");
+                }
+            }
+            log::info!(target: "app", "AudioShare 启动");
+
             // 初始化全局音频引擎状态
             commands::init_engine(app.handle().clone());
 
@@ -70,6 +104,7 @@ pub fn run() {
             greet,
             commands::get_apps,
             commands::get_mics,
+            commands::check_default_mic,
             commands::get_status,
             commands::toggle_share,
             commands::set_volume,
@@ -77,6 +112,9 @@ pub fn run() {
             commands::toggle_master,
             commands::finish_onboarding,
             commands::install_cable,
+            commands::get_remember,
+            commands::set_remember,
+            commands::write_log,
             commands::get_version,
             commands::quit_app
         ])

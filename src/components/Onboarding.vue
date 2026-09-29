@@ -2,11 +2,12 @@
 /**
  * 首次配置引导：三步级联点亮（TC-004）
  * 第1步：引导用户安装 VB-CABLE（打开安装程序，用户手动完成）
+ * 第2步：默认输入设备改为 CABLE Input，每 10s 轮询后端 check_default_mic 自动点亮
  */
-import { ref, computed } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { openUrl } from '@tauri-apps/plugin-opener'
-import { store, finishOnboarding } from '../stores/app'
+import { store, finishOnboarding, logFrontend } from '../stores/app'
 
 interface InstallResult { installed: boolean; already: boolean; message: string }
 interface AppStatus { cable_installed: boolean; master_on: boolean; onboarding_done: boolean; mic_id: string }
@@ -18,10 +19,35 @@ const step = computed(() => {
   return 2
 })
 const done2 = ref(false)
+const micHint = ref('')
 const installing = ref(false)
 const installErr = ref('')
 const showManualModal = ref(false)
 const emit = defineEmits<{ close: [] }>()
+
+// 第2步轮询：每 10s 检查系统默认麦克风是否已设为 VB-CABLE，命中即自动点亮
+let micTimer: ReturnType<typeof setInterval> | null = null
+async function checkMic() {
+  if (done2.value) return
+  try {
+    const ok = await invoke<boolean>('check_default_mic')
+    if (ok) {
+      done2.value = true
+      micHint.value = ''
+    } else if (step.value === 2) {
+      micHint.value = '尚未检测到，请在系统声音设置中将默认输入设备改为 CABLE Input（每 10 秒自动复查）'
+    }
+  } catch (err) {
+    logFrontend('warn', `check_default_mic 失败: ${err}`)
+  }
+}
+onMounted(() => {
+  checkMic()
+  micTimer = setInterval(checkMic, 10_000)
+})
+onBeforeUnmount(() => {
+  if (micTimer) clearInterval(micTimer)
+})
 
 async function install() {
   installing.value = true
@@ -52,6 +78,10 @@ async function openOfficial() {
   await openUrl(VB_CABLE_URL)
 }
 
+async function openSoundSettings() {
+  await openUrl('ms-settings:sound')
+}
+
 async function recheck() {
   // 用户手动安装后重新检测虚拟声卡
   const s = await invoke<AppStatus>('get_status')
@@ -68,7 +98,7 @@ async function recheck() {
   <div class="overlay show" role="dialog" aria-modal="true" aria-label="首次配置引导">
     <div class="modal">
       <h2>欢迎使用 AudioShare</h2>
-      <p class="sub">三步完成配置</p>
+      <p class="sub">两步完成配置</p>
 
       <div class="step" :class="{ done: step > 1, current: step === 1 }">
         <div class="num">{{ step > 1 ? '✓' : '1' }}</div>
@@ -86,26 +116,19 @@ async function recheck() {
       <div class="step" :class="{ done: done2, current: step === 2 && !done2, dim: step < 2 }">
         <div class="num">{{ done2 ? '✓' : '2' }}</div>
         <div class="c">
-          <b>聊天软件里选输入设备</b>
+          <b>输入设备修改</b>
           <p>将windows默认输入设备选为「CABLE Input (VB-Audio Virtual Cable)」。</p>
+          <p v-if="micHint" class="err">{{ micHint }}</p>
+          <button class="btn ghost small" @click="openSoundSettings">打开声音设置</button>
         </div>
-        <button v-if="step === 2 && !done2" class="btn" @click="done2 = true">我已选好</button>
-        <span v-else-if="done2" class="status done">已选择 ✓</span>
+        <button v-if="step === 2 && !done2" class="btn" @click="checkMic">立即检测</button>
+        <span v-else-if="done2" class="status done">已检测 ✓</span>
         <span v-else class="status todo">等待第 1 步</span>
-      </div>
-
-      <div class="step" :class="{ current: done2, dim: !done2 }">
-        <div class="num">3</div>
-        <div class="c">
-          <b>完成</b>
-        </div>
-        <span v-if="!done2" class="status todo">等待第 2 步</span>
-        <span v-else class="status done">可以开始了 ✓</span>
       </div>
 
       <div class="modal-foot">
         <button class="btn ghost" @click="emit('close')">稍后再说</button>
-        <button class="btn" @click="finishOnboarding()">开始使用</button>
+        <button class="btn" :disabled="!done2" @click="finishOnboarding()">开始使用</button>
       </div>
     </div>
 
@@ -143,6 +166,7 @@ h2 { font-size: 15px; font-weight: 600; margin-bottom: 2px; }
 .status.todo { color: #8a8a8a; }
 .modal-foot { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
 .btn { border: 1px solid #0067c0; border-radius: 4px; padding: 5px 14px; font-size: 11.5px; cursor: pointer; background: #0067c0; color: #fff; font-family: inherit; }
+.btn.small { padding: 3px 10px; font-size: 11px; margin-top: 6px; }
 .btn:hover { background: #1975c5; }
 .btn:disabled { opacity: .45; cursor: default; }
 .btn.ghost { background: transparent; color: #0067c0; }

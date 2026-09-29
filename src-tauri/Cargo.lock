@@ -209,8 +209,9 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "audioshare"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
+ "log",
  "rtrb",
  "serde",
  "serde_json",
