@@ -2,7 +2,7 @@
 /**
  * 主窗口：组合全部组件（对应原型 v6）
  */
-import { onMounted, ref } from 'vue'
+import { onMounted, ref, watch } from 'vue'
 import { listen } from '@tauri-apps/api/event'
 import { check } from '@tauri-apps/plugin-updater'
 import { store, initStore, toggleMaster, quitApp } from '../stores/app'
@@ -16,10 +16,24 @@ const updateInfo = ref({ version: '', body: '' })
 const updateProgress = ref(0)
 const updateError = ref('')
 
+/** 关闭更新提示 */
+function closeUpdateToast() {
+  updateStatus.value = 'idle'
+  updateProgress.value = 0
+}
+
+// 自动关闭：已是最新 / 出错 3 秒后自动隐藏
+watch(updateStatus, (s) => {
+  if (s === 'latest' || s === 'error') {
+    setTimeout(closeUpdateToast, 3000)
+  }
+})
+
 /** 检查并安装更新 */
 async function doCheckUpdate() {
   updateStatus.value = 'checking'
   updateError.value = ''
+  updateProgress.value = 0
   try {
     const update = await check()
     if (!update) {
@@ -27,12 +41,9 @@ async function doCheckUpdate() {
       return
     }
     updateInfo.value = { version: update.version, body: update.body || '' }
-    updateStatus.value = 'available'
-    // 自动下载并安装
     updateStatus.value = 'downloading'
     await update.downloadAndInstall((event) => {
       if (event.event === 'Progress') {
-        // Progress 事件只有 chunkLength，无总大小，用累计字节数近似显示
         updateProgress.value = Math.min(99, updateProgress.value + 5)
       } else if (event.event === 'Finished') {
         updateStatus.value = 'installing'
@@ -102,12 +113,14 @@ onMounted(async () => {
 
     <!-- 更新状态提示 -->
     <div v-if="updateStatus !== 'idle'" class="update-toast">
-      <template v-if="updateStatus === 'checking'">🔍 正在检查更新…</template>
-      <template v-else-if="updateStatus === 'latest'">✅ 已是最新版本</template>
-      <template v-else-if="updateStatus === 'available'">📦 发现新版本 v{{ updateInfo.version }}，正在下载…</template>
-      <template v-else-if="updateStatus === 'downloading'">⬇️ 下载中 {{ updateProgress }}%</template>
-      <template v-else-if="updateStatus === 'installing'">⚙️ 安装中，即将重启…</template>
-      <template v-else-if="updateStatus === 'error'">❌ 更新失败：{{ updateError }}</template>
+      <span class="update-msg">
+        <template v-if="updateStatus === 'checking'">🔍 正在检查更新…</template>
+        <template v-else-if="updateStatus === 'latest'">✅ 已是最新版本</template>
+        <template v-else-if="updateStatus === 'downloading'">⬇️ 下载中 {{ updateProgress }}%</template>
+        <template v-else-if="updateStatus === 'installing'">⚙️ 安装中，即将重启…</template>
+        <template v-else-if="updateStatus === 'error'">❌ 更新失败：{{ updateError }}</template>
+      </span>
+      <button class="update-close" @click="closeUpdateToast" title="关闭">✕</button>
     </div>
   </div>
 </template>
@@ -152,5 +165,7 @@ body { overflow: hidden; }
 .footnote.quit { margin-top: auto; }
 .footnote a { color: #8a8a8a; }
 .fieldlab { font-size: 11px; color: #5d5d5d; margin-bottom: 5px; display: block; }
-.update-toast { position: fixed; bottom: 40px; left: 50%; transform: translateX(-50%); background: #1b1b1b; color: #fff; padding: 8px 16px; border-radius: 6px; font-size: 12px; white-space: nowrap; z-index: 100; box-shadow: 0 2px 8px rgba(0,0,0,.2); }
+.update-toast { position: fixed; bottom: 40px; left: 50%; transform: translateX(-50%); background: #1b1b1b; color: #fff; padding: 8px 12px 8px 16px; border-radius: 6px; font-size: 12px; white-space: nowrap; z-index: 100; box-shadow: 0 2px 8px rgba(0,0,0,.2); display: flex; align-items: center; gap: 10px; }
+.update-close { background: none; border: none; color: #aaa; cursor: pointer; font-size: 14px; padding: 0 2px; line-height: 1; }
+.update-close:hover { color: #fff; }
 </style>
