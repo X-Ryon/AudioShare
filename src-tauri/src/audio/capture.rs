@@ -275,8 +275,9 @@ fn capture_thread(pid: u32, stop: Arc<Mutex<bool>>, tx: mpsc::Sender<SetupResult
                 if *stop.lock().unwrap() {
                     break;
                 }
-                // 轮询间隔 50ms（平衡 CPU 与延迟）
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                // 轮询间隔 10ms：与渲染周期同量级平滑供给，避免长间隔 burst 推送
+                // 导致混音端取数不均（队列空时补零、溢出时丢弃 → 波形断裂杂音）
+                std::thread::sleep(std::time::Duration::from_millis(10));
                 let mut packet_size = match capture.GetNextPacketSize() {
                     Ok(n) => n,
                     Err(_) => {
