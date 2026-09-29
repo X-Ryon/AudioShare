@@ -246,19 +246,31 @@ fn mixer_loop_with_stop(app: AppHandle, stop: Arc<Mutex<bool>>) {
         if !sink.wait(200) {
             continue;
         }
+        // 事件驱动节奏：每 tick 恰好填满一个可用周期，不足补零。
+        // 修复：原实现每 tick 弹空队列后整段写入，超出 available 的样本被丢弃、
+        // 队列空时不写，导致缓冲干涸 → 静音/数据交替 → 麦克风端持续杂音。
+        let available = match sink.available_frames() {
+            Ok(n) => n as usize,
+            Err(_) => break,
+        };
+        if available == 0 {
+            continue;
+        }
+        let need = available * sink.channels as usize;
         let (buffers, mic_buf) = {
             let mut eng = ENGINE.lock().unwrap();
             let Some(e) = eng.as_mut() else { break };
             let mut bufs: Vec<Vec<f32>> = Vec::new();
             for (pid, st) in e.sources.iter_mut() {
-                let mut buf: Vec<f32> = Vec::new();
-                while let Ok(s) = st.consumer.pop() {
-                    buf.push(s);
+                // 按本周期帧数等量拉取，不足部分视为静音（mix 补零），
+                // 避免 burst 弹空+丢弃导致渲染缓冲干涸 → 周期性断裂杂音
+                let mut buf = vec![0f32; need];
+                let (filled, _) = st.consumer.pop_partial_slice(&mut buf);
+                let got = filled.len();
+                buf.truncate(got);
+                if got > 0 {
+                    st.level = rms_level(&buf);
                 }
-                if buf.is_empty() {
-                    continue;
-                }
-                st.level = rms_level(&buf);
                 let gain = if e.master_on {
                     e.gains.gain(*pid).unwrap_or(1.0)
                 } else {
@@ -266,20 +278,20 @@ fn mixer_loop_with_stop(app: AppHandle, stop: Arc<Mutex<bool>>) {
                 };
                 bufs.push(buf.iter().map(|s| s * gain).collect());
             }
-            let mut mic_buf: Vec<f32> = Vec::new();
+            let mut mic_buf = vec![0f32; need];
             if let Some(mc) = e.mic_consumer.as_mut() {
-                while let Ok(s) = mc.pop() {
-                    mic_buf.push(s);
-                }
+                let (filled, _) = mc.pop_partial_slice(&mut mic_buf);
+                let got = filled.len();
+                mic_buf.truncate(got);
             }
             (bufs, mic_buf)
         };
         let mut refs: Vec<(&[f32], f32)> = buffers.iter().map(|b| (b.as_slice(), 1.0f32)).collect();
         refs.push((mic_buf.as_slice(), 1.0f32));
-        let out = mix(&refs);
-        if !out.is_empty() {
-            let _ = sink.write(&out);
-        }
+        let mut out = mix(&refs);
+        // 补零至整周期：即使源全部静音也持续填充，渲染端无 underflow 间隙
+        out.resize(need, 0.0);
+        let _ = sink.write(&out);
         tick += 1;
         if tick % 3 == 0 {
             let levels: Vec<(u32, f32)> = {

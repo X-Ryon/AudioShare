@@ -87,7 +87,7 @@ async function recheck() {
         <div class="num">{{ done2 ? '✓' : '2' }}</div>
         <div class="c">
           <b>聊天软件里选输入设备</b>
-          <p>在微信 / QQ / 游戏语音的麦克风设置里，把输入设备选为「CABLE Input (VB-Audio Virtual Cable)」。</p>
+          <p>将windows默认输入设备选为「CABLE Input (VB-Audio Virtual Cable)」。</p>
         </div>
         <button v-if="step === 2 && !done2" class="btn" @click="done2 = true">我已选好</button>
         <span v-else-if="done2" class="status done">已选择 ✓</span>

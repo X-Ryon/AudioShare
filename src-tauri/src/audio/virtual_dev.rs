@@ -97,6 +97,15 @@ impl VirtualSink {
         unsafe { WaitForSingleObject(self.event, timeout_ms) == windows::Win32::Foundation::WAIT_OBJECT_0 }
     }
 
+    /// 当前可写帧数（事件触发后应填充：缓冲总量 - 已填充未播放）。
+    /// 混音循环据此按周期等量拉取样本，不足补零，避免缓冲干涸导致波形断裂杂音。
+    pub fn available_frames(&self) -> windows::core::Result<u32> {
+        unsafe {
+            let padding = self.client.GetCurrentPadding()?;
+            Ok(self.buffer_frames.saturating_sub(padding))
+        }
+    }
+
     /// 写入一帧混音结果（interleaved f32，声道数须匹配）
     pub fn write(&self, frames: &[f32]) -> windows::core::Result<()> {
         unsafe {
