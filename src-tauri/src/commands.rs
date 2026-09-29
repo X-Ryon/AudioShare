@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -16,6 +17,9 @@ use crate::audio::device_enum::{self, AudioApp, MicDevice};
 use crate::audio::mic_capture::MicCapture;
 use crate::audio::mixer::{mix, rms_level, SourceTable};
 use crate::audio::virtual_dev::VirtualSink;
+
+// 图标缓存：exe 路径 -> base64 PNG
+static ICON_CACHE: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AppStatus {
@@ -457,6 +461,8 @@ fn mixer_loop_with_stop(app: AppHandle, stop: Arc<Mutex<bool>>) {
         // 每 100 tick（约 2 秒）清理已退出的进程源，防止内存无限增长
         if tick % 100 == 0 {
             cleanup_dead_sources();
+            // 自动为检测到的新音频会话创建监控源（shared=false，仅监控不混音）
+            ensure_monitoring();
         }
     }
 }
@@ -481,6 +487,54 @@ fn cleanup_dead_sources() {
         }
         e.gains.remove(pid);
         e.volumes.remove(&pid);
+    }
+}
+
+/// 自动为检测到的新音频会话创建监控源（shared=false，仅监控不混音）
+/// 在混音循环中定期调用，使应用启动时即可监听播放状态与实时音量
+fn ensure_monitoring() {
+    // 1. 获取当前所有音频会话应用
+    let apps = device_enum::list_audio_apps();
+    
+    // 2. 找出尚未监控的应用（持锁时间极短）
+    let new_apps: Vec<_> = {
+        let eng = ENGINE.lock().unwrap();
+        let Some(e) = eng.as_ref() else { return };
+        apps.into_iter()
+            .filter(|a| !e.sources.contains_key(&a.pid))
+            .collect()
+    };
+    
+    // 3. 为每个新应用创建监控源（锁外执行，避免阻塞混音循环）
+    for app_info in new_apps {
+        // ProcessCapture::new() 是阻塞操作（最长 5s），在锁外执行
+        match ProcessCapture::new(app_info.pid) {
+            Ok((capture, consumer)) => {
+                let mut eng = ENGINE.lock().unwrap();
+                if let Some(e) = eng.as_mut() {
+                    // 双重检查：防止创建期间已被其他逻辑插入
+                    if !e.sources.contains_key(&app_info.pid) {
+                        e.sources.insert(
+                            app_info.pid,
+                            SourceState {
+                                exe: app_info.exe.clone(),
+                                capture,
+                                consumer,
+                                level: 0.0,
+                                shared: false, // 仅监控，不参与混音
+                            },
+                        );
+                        e.gains.add(app_info.pid);
+                        e.volumes.insert(app_info.pid, 80); // 默认 80%
+                        e.gains.set_gain(app_info.pid, 0.8);
+                        log::info!(target: "monitor", "自动开始监控 pid={} exe={}", app_info.pid, app_info.exe);
+                    }
+                }
+            }
+            Err(err) => {
+                log::warn!(target: "monitor", "创建监控源失败 pid={} exe={}: {}", app_info.pid, app_info.exe, err);
+            }
+        }
     }
 }
 
@@ -651,4 +705,150 @@ pub fn quit_app(app: AppHandle) {
         e.stop_thread();
     }
     app.exit(0);
+}
+
+// ---------- 应用图标提取 ----------
+
+/// 获取进程的 exe 路径
+fn get_exe_path_from_pid(pid: u32) -> Option<String> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    use windows::Win32::System::ProcessStatus::GetModuleFileNameExW;
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        if handle.is_invalid() {
+            return None;
+        }
+
+        let mut buffer = [0u16; 1024];
+        let len = GetModuleFileNameExW(
+            Some(handle),
+            None,
+            &mut buffer,
+        );
+        let _ = CloseHandle(handle);
+
+        if len == 0 {
+            return None;
+        }
+
+        Some(String::from_utf16_lossy(&buffer[..len as usize]))
+    }
+}
+
+/// 从 exe 文件提取图标并转换为 base64 PNG
+fn extract_icon_as_base64(exe_path: &str) -> Option<String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::Shell::ExtractIconExW;
+    use windows::Win32::Graphics::Gdi::{GetDC, ReleaseDC, CreateCompatibleDC, CreateDIBSection, SelectObject, DeleteDC, DeleteObject, BITMAPINFOHEADER, BITMAPINFO, DIB_RGB_COLORS, BI_RGB};
+    use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, DrawIconEx, DI_NORMAL};
+
+    unsafe {
+        // 提取大图标（32x32 或更大）
+        let path_wide: Vec<u16> = exe_path.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut hicon = windows::Win32::UI::WindowsAndMessaging::HICON::default();
+        let count = ExtractIconExW(
+            PCWSTR(path_wide.as_ptr()),
+            0,
+            Some(&mut hicon),  // 大图标
+            None,              // 不需要小图标
+            1,
+        );
+
+        if count == 0 || hicon.is_invalid() {
+            return None;
+        }
+
+        // 固定渲染尺寸 32x32（适合 UI 显示）
+        const ICON_SIZE: i32 = 32;
+
+        // 创建内存 DC
+        let hdc_screen = GetDC(None);
+        let hdc_mem = CreateCompatibleDC(Some(hdc_screen));
+
+        // 创建 DIB（32x32, 32 位 BGRA）
+        let mut bi = BITMAPINFOHEADER::default();
+        bi.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        bi.biWidth = ICON_SIZE;
+        bi.biHeight = -ICON_SIZE; // 自上而下
+        bi.biPlanes = 1;
+        bi.biBitCount = 32;
+        bi.biCompression = BI_RGB.0 as u32;
+
+        let bitmap_info = BITMAPINFO {
+            bmiHeader: bi,
+            bmiColors: [Default::default()],
+        };
+
+        let mut pixels: *mut u8 = std::ptr::null_mut();
+        let hbitmap = CreateDIBSection(
+            Some(hdc_mem),
+            &bitmap_info,
+            DIB_RGB_COLORS,
+            &mut pixels as *mut *mut u8 as *mut *mut _,
+            None,
+            0,
+        ).ok()?;
+
+        let old_bitmap = SelectObject(hdc_mem, hbitmap.into());
+
+        // 绘制图标到 DC（缩放到 32x32）
+        let _ = DrawIconEx(hdc_mem, 0, 0, hicon, ICON_SIZE, ICON_SIZE, 0, None, DI_NORMAL);
+
+        // 读取像素数据（BGRA -> RGBA）
+        let pixel_count = (ICON_SIZE * ICON_SIZE) as usize;
+        let mut rgba_data = Vec::with_capacity(pixel_count * 4);
+
+        for i in 0..pixel_count {
+            let offset = i * 4;
+            rgba_data.push(*pixels.add(offset + 2)); // R
+            rgba_data.push(*pixels.add(offset + 1)); // G
+            rgba_data.push(*pixels.add(offset));     // B
+            rgba_data.push(*pixels.add(offset + 3)); // A
+        }
+
+        // 清理 GDI 对象
+        SelectObject(hdc_mem, old_bitmap);
+        let _ = DeleteObject(hbitmap.into());
+        let _ = DeleteDC(hdc_mem);
+        let _ = ReleaseDC(None, hdc_screen);
+        let _ = DestroyIcon(hicon);
+
+        // 转换为 PNG
+        let img = image::RgbaImage::from_raw(ICON_SIZE as u32, ICON_SIZE as u32, rgba_data)?;
+        let mut png_data = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut png_data), image::ImageFormat::Png).ok()?;
+
+        // 转换为 base64
+        use base64::Engine;
+        let base64_str = base64::engine::general_purpose::STANDARD.encode(&png_data);
+        Some(format!("data:image/png;base64,{}", base64_str))
+    }
+}
+
+/// 获取应用图标（base64 PNG）
+#[tauri::command]
+pub fn get_app_icon(pid: u32) -> Option<String> {
+    // 获取 exe 路径
+    let exe_path = get_exe_path_from_pid(pid)?;
+
+    // 检查缓存
+    {
+        let cache = ICON_CACHE.lock().unwrap();
+        if let Some(icon) = cache.get(&exe_path) {
+            return Some(icon.clone());
+        }
+    }
+
+    // 提取图标
+    let icon = extract_icon_as_base64(&exe_path)?;
+
+    // 存入缓存
+    {
+        let mut cache = ICON_CACHE.lock().unwrap();
+        cache.insert(exe_path, icon.clone());
+    }
+
+    Some(icon)
 }
