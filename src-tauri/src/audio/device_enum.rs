@@ -2,7 +2,7 @@
 //! 追溯：TC-008（麦克风枚举）、TC-016（仅列具备扬声器权限的应用）、TC-006/011（CABLE 检测）
 
 use serde::Serialize;
-use windows::core::{Interface, PCWSTR};
+use windows::core::{HRESULT, Interface, PCWSTR};
 use windows::Win32::Foundation::PROPERTYKEY;
 use windows::Win32::Media::Audio::Endpoints::IAudioMeterInformation;
 use windows::Win32::Media::Audio::{
@@ -310,9 +310,119 @@ pub fn list_audio_apps() -> Vec<AudioApp> {
     }
 }
 
+/// 启动切换判定（纯函数，TDD）：CABLE 存在且默认非 CABLE 才切
+/// 追溯 TC-031/033/034。
+pub fn should_switch_mic(default_is_cable: bool, cable_exists: bool) -> bool {
+    cable_exists && !default_is_cable
+}
+
+/// 退出回切判定（纯函数，TDD）：有原设备记录且 CABLE 存在才回切
+/// 追溯 TC-032/034。
+pub fn should_restore_mic(saved: Option<&str>, cable_exists: bool) -> bool {
+    saved.is_some() && cable_exists
+}
+
+/// IPolicyConfig（手写 COM）：vtable 槽位 0-9 为占位方法（仅保证 ABI 对齐，运行时不调用），
+/// 槽位 10=SetDefaultEndpoint（唯一调用点）、槽位 11=SetEndpointVisibility。
+/// 占位参数统一用裸指针，避免为未用方法引入 WAVEFORMATEX/PROPVARIANT 等类型依赖。
+#[windows::core::interface("f8679f50-850a-41cf-9c72-430f290290c8")]
+unsafe trait IPolicyConfig: windows::core::IUnknown {
+    unsafe fn GetMixFormat(&self, pdevice: PCWSTR, pwfx: *mut core::ffi::c_void) -> HRESULT;
+    unsafe fn GetDeviceFormat(&self, pdevice: PCWSTR, bdefault: i32, pwfx: *mut core::ffi::c_void) -> HRESULT;
+    unsafe fn ResetDeviceFormat(&self, pdevice: PCWSTR) -> HRESULT;
+    unsafe fn SetDeviceFormat(&self, pdevice: PCWSTR, pendpointformat: *mut core::ffi::c_void, pmixformat: *mut core::ffi::c_void) -> HRESULT;
+    unsafe fn GetProcessingPeriod(&self, pdevice: PCWSTR, bdefault: i32, phnperiod: *mut i64, phnminperiod: *mut i64) -> HRESULT;
+    unsafe fn SetProcessingPeriod(&self, pdevice: PCWSTR, hnperiod: *const i64) -> HRESULT;
+    unsafe fn GetShareMode(&self, pdevice: PCWSTR, pmode: *mut i32) -> HRESULT;
+    unsafe fn SetShareMode(&self, pdevice: PCWSTR, mode: i32) -> HRESULT;
+    unsafe fn GetPropertyValue(&self, pdevice: PCWSTR, key: *mut core::ffi::c_void, pvalue: *mut core::ffi::c_void) -> HRESULT;
+    unsafe fn SetPropertyValue(&self, pdevice: PCWSTR, key: *mut core::ffi::c_void, pvalue: *mut core::ffi::c_void) -> HRESULT;
+    unsafe fn SetDefaultEndpoint(&self, pdevice: PCWSTR, erole: i32) -> HRESULT;
+    unsafe fn SetEndpointVisibility(&self, pdevice: PCWSTR, bvisible: i32) -> HRESULT;
+}
+
+/// 查找 VB-Cable 采集端点 id：eCapture 枚举中友好名含 "CABLE" 的端点
+/// （VB-Cable 虚拟麦克风在录音设备列表显示为 "CABLE Output"）。追溯 TC-031。
+pub fn find_cable_capture_id() -> Option<String> {
+    ensure_com();
+    unsafe {
+        let enumerator = new_device_enumerator().ok()?;
+        let collection = enumerator.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE).ok()?;
+        for i in 0..collection.GetCount().unwrap_or(0) {
+            if let Ok(dev) = collection.Item(i) {
+                if let Ok(name) = get_friendly_name(&dev) {
+                    if name.to_uppercase().contains("CABLE") {
+                        if let Ok(id) = dev.GetId() {
+                            return Some(pwstr_to_string(PCWSTR(id.0)));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+/// 当前默认输入设备（eConsole）id。追溯 TC-031/032。
+pub fn get_default_capture_id() -> Option<String> {
+    ensure_com();
+    unsafe {
+        let enumerator = new_device_enumerator().ok()?;
+        let dev = enumerator.GetDefaultAudioEndpoint(eCapture, eConsole).ok()?;
+        let id = dev.GetId().ok()?;
+        Some(pwstr_to_string(PCWSTR(id.0)))
+    }
+}
+
+/// 设置默认输入设备：IPolicyConfig::SetDefaultEndpoint(id, eConsole + eCommunications)
+/// 双角色都设置，保证会议/语音软件无论按哪个角色取默认都能拿到新设备。追溯 TC-031/032。
+pub fn set_default_capture_device(id: &str) -> Result<(), String> {
+    ensure_com();
+    unsafe {
+        // CLSID_IPolicyConfig {870af99c-171d-4f9e-af0d-e63df40c2bc9}（与 IID 相同）
+        let clsid = windows::core::GUID::from_u128(0x870af99c_171d_4f9e_af0d_e63df40c2bc9);
+        let pc: IPolicyConfig = windows::Win32::System::Com::CoCreateInstance(&clsid, None, CLSCTX_ALL)
+            .map_err(|e| format!("创建 IPolicyConfig 失败: {e}"))?;
+        let wide: Vec<u16> = id.encode_utf16().chain(std::iter::once(0)).collect();
+        let p = PCWSTR(wide.as_ptr());
+        pc.SetDefaultEndpoint(p, eConsole.0)
+            .ok()
+            .map_err(|e| format!("SetDefaultEndpoint(eConsole) 失败: {e}"))?;
+        pc.SetDefaultEndpoint(p, eCommunications.0)
+            .ok()
+            .map_err(|e| format!("SetDefaultEndpoint(eCommunications) 失败: {e}"))?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TC-031/033/034：仅"默认非CABLE 且 CABLE 存在"才切换
+    #[test]
+    fn switch_only_when_cable_and_not_default() {
+        assert!(should_switch_mic(false, true));
+        assert!(!should_switch_mic(true, true));
+        assert!(!should_switch_mic(false, false));
+        assert!(!should_switch_mic(true, false));
+    }
+
+    /// TC-032/034：仅"有原设备记录 且 CABLE 存在"才回切
+    #[test]
+    fn restore_only_when_saved_and_cable() {
+        assert!(should_restore_mic(Some("mic-id"), true));
+        assert!(!should_restore_mic(Some("mic-id"), false));
+        assert!(!should_restore_mic(None, true));
+        assert!(!should_restore_mic(None, false));
+    }
+
+    /// 本机冒烟：查询函数调用不 panic（TC-031/032 真机验收，此处只验不崩溃）
+    #[test]
+    fn cable_and_default_id_queries_no_panic() {
+        let _ = find_cable_capture_id();
+        let _ = get_default_capture_id();
+    }
 
     #[test]
     fn exe_display_name_known_apps() {

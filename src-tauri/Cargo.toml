@@ -1,6 +1,6 @@
 [package]
 name = "audioshare"
-version = "0.7.0"
+version = "0.9.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -21,6 +21,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-global-shortcut = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-store = "2"
 tauri-plugin-updater = "2"
@@ -45,6 +46,7 @@ windows = { version = "0.62", features = [
   "Win32_UI_Shell",
   "Win32_Graphics_Gdi",
   "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_Input_KeyboardAndMouse",
 ] }
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png"] }

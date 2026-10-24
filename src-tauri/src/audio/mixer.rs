@@ -15,6 +15,16 @@ pub fn mix(buffers: &[(&[f32], f32)]) -> Vec<f32> {
     out
 }
 
+/// 输出闭麦（第3期 TC-053/058）：muted 时整帧清零，未闭麦原样返回。
+/// 在 mix 之后、写设备之前调用；仅静音输出，不改变共享状态、不持久化。
+pub fn finalize_output(out: Vec<f32>, muted: bool) -> Vec<f32> {
+    if muted {
+        out.iter().map(|_| 0.0).collect()
+    } else {
+        out
+    }
+}
+
 /// 计算 PCM 帧的 RMS 电平（用于前端电平条）。
 pub fn rms_level(frames: &[f32]) -> f32 {
     if frames.is_empty() {
@@ -129,5 +139,20 @@ mod tests {
         t.remove(100);
         assert_eq!(t.gain(100), None);
         t.remove(100); // 幂等
+    }
+
+    /// TC-053：闭麦 → 整帧清零（音乐+人声全部静音）
+    #[test]
+    fn tc053_mute_zeroes_output_frame() {
+        let out = finalize_output(vec![0.5, -0.3, 0.0], true);
+        assert_eq!(out, vec![0.0, 0.0, 0.0]);
+    }
+
+    /// TC-053：未闭麦 → 原样透传（不引入增益变化）
+    #[test]
+    fn tc053_unmute_passes_through() {
+        let src = vec![0.5, -0.3, 0.0];
+        let out = finalize_output(src.clone(), false);
+        assert_eq!(out, src);
     }
 }

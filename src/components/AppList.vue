@@ -4,7 +4,7 @@
  * 替代原 AppDropdown + SharedPanel 组合
  */
 import { computed, reactive, onMounted, watch } from 'vue'
-import { store, toggleShare, setVolume } from '../stores/app'
+import { store, toggleShare, setVolume, toggleFavorite } from '../stores/app'
 import { invoke } from '@tauri-apps/api/core'
 import MarqueeText from './MarqueeText.vue'
 
@@ -49,8 +49,14 @@ function levelPct(pid: number): string {
   <div class="app-list">
     <div v-if="!rows.length" class="empty">暂无可用应用…</div>
     <div v-for="app in rows" :key="app.pid" class="row">
-      <!-- 左列：状态点 + 图标 + 名称 + 电平条 -->
+      <!-- 左列：星标 + 状态点 + 图标 + 名称 + 电平条 -->
       <div class="left">
+        <button class="fav" :aria-pressed="store.favorites.has(app.exe.toLowerCase())"
+          :title="store.favorites.has(app.exe.toLowerCase()) ? '取消收藏（停止自动共享）' : '收藏（播放时自动共享）'"
+          :aria-label="`${store.favorites.has(app.exe.toLowerCase()) ? '取消收藏' : '收藏'} ${app.name}`"
+          @click="toggleFavorite(app.exe)">
+          {{ store.favorites.has(app.exe.toLowerCase()) ? '★' : '☆' }}
+        </button>
         <span class="dot" :class="{ playing: app.playing }" :title="app.playing ? '正在播放' : '未播放'" />
         <img v-if="icons[app.pid]" :src="icons[app.pid]" class="app-icon" :alt="app.name" />
         <div v-else class="app-icon placeholder" />
@@ -85,6 +91,10 @@ function levelPct(pid: number): string {
 .row { display: flex; align-items: center; gap: 10px; padding: 8px 10px 8px 2px; border-bottom: 1px solid #e5e5e5; }
 .row:last-child { border-bottom: none; }
 .left { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; }
+.fav { border: none; background: none; cursor: pointer; font-size: 13px; line-height: 1; padding: 1px 2px; color: #b3b3b3; flex-shrink: 0; }
+.fav:hover { color: #ffb900; }
+.fav[aria-pressed="true"] { color: #ffb900; }
+.fav:focus-visible { outline: 2px solid #0067c0; outline-offset: 2px; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: #d32f2f; flex-shrink: 0; }
 .dot.playing { background: #2e7d32; }
 .app-icon { width: 18px; height: 18px; border-radius: 3px; flex-shrink: 0; object-fit: contain; }

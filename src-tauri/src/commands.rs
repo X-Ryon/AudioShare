@@ -3,7 +3,7 @@
 //! 混音线程每 tick 短暂持锁拉取各源帧（rtrb 消费需要 &mut），命令层临界区极短，无阻塞风险。
 //! 阻塞式初始化（MicCapture/ProcessCapture）一律在锁外完成，避免持锁阻塞导致 UI 卡死。
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::sync::LazyLock;
 
@@ -15,8 +15,10 @@ use tauri_plugin_store::StoreExt;
 use crate::audio::capture::ProcessCapture;
 use crate::audio::device_enum::{self, AudioApp, MicDevice};
 use crate::audio::mic_capture::MicCapture;
-use crate::audio::mixer::{mix, rms_level, SourceTable};
+use crate::audio::mixer::{finalize_output, mix, rms_level, SourceTable};
 use crate::audio::virtual_dev::VirtualSink;
+use crate::hotkeys::{self, HotkeyConfig};
+use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
 // 图标缓存：exe 路径 -> base64 PNG
 static ICON_CACHE: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -28,6 +30,8 @@ pub struct AppStatus {
     pub onboarding_done: bool,
     pub mic_id: String,
     pub shared: Vec<SharedInfo>,
+    /// 输出闭麦状态（第3期 TC-053：不持久化，重启复位）
+    pub output_muted: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -44,6 +48,12 @@ struct SourceState {
     level: f32,
     /// 是否参与混音输出（false 时仍监控电平，但不混入虚拟声卡）
     shared: bool,
+    /// 连续高电平 tick 数（播放判定，阈值 PLAY_THRESHOLD）
+    playing_ticks: u32,
+    /// 连续静音 tick 数（停止判定，需 SILENT_TICKS_STOP 个周期）
+    silent_ticks: u32,
+    /// 是否为自动共享（用户手动取消后不再自动重开）
+    auto_shared: bool,
 }
 
 struct Engine {
@@ -59,6 +69,12 @@ struct Engine {
     sink_running: bool,
     thread_stop: Arc<Mutex<bool>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// 收藏的自动共享应用（小写 exe）
+    favorites: HashSet<String>,
+    /// 本次会话用户手动取消过自动共享的 exe（防止电平仍在而反复自动重开）
+    auto_opt_out: HashSet<String>,
+    /// 输出闭麦（第3期）：mix 后整帧清零；不持久化、不影响共享状态
+    output_muted: bool,
 }
 
 impl Engine {
@@ -76,6 +92,9 @@ impl Engine {
             sink_running: false,
             thread_stop: Arc::new(Mutex::new(false)),
             thread: None,
+            favorites: HashSet::new(),
+            auto_opt_out: HashSet::new(),
+            output_muted: false,
         }
     }
 
@@ -193,6 +212,91 @@ pub fn set_remember(on: bool) {
     }
 }
 
+// ---------- 默认麦克风自动切换持久化：original_mic.json 记录原默认输入设备（第2期 P1） ----------
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OriginalMic {
+    id: String,
+}
+
+const ORIGINAL_MIC_FILE: &str = "original_mic.json";
+
+fn original_mic_path(app: &AppHandle) -> Option<std::path::PathBuf> {
+    crate::data_dir(app).map(|d| d.join(ORIGINAL_MIC_FILE))
+}
+
+fn load_original_mic(app: &AppHandle) -> Option<String> {
+    let p = original_mic_path(app)?;
+    let raw = std::fs::read_to_string(&p).ok()?;
+    match serde_json::from_str::<OriginalMic>(&raw) {
+        Ok(m) if !m.id.is_empty() => Some(m.id),
+        Ok(_) => None,
+        Err(e) => {
+            log::warn!(target: "mic", "original_mic.json 解析失败，忽略记录: {e}");
+            None
+        }
+    }
+}
+
+fn save_original_mic(app: &AppHandle, id: &str) {
+    let Some(p) = original_mic_path(app) else { return };
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let cfg = OriginalMic { id: id.to_string() };
+    if let Err(e) = serde_json::to_string_pretty(&cfg)
+        .map_err(|e| e.to_string())
+        .and_then(|s| std::fs::write(&p, s).map_err(|e| e.to_string()))
+    {
+        log::error!(target: "mic", "original_mic.json 写入失败: {e}");
+    }
+}
+
+fn clear_original_mic(app: &AppHandle) {
+    let Some(p) = original_mic_path(app) else { return };
+    let _ = std::fs::remove_file(&p);
+}
+
+/// 启动钩子：默认非 CABLE 且 CABLE 在线时，记录原默认麦克风并切到 CABLE。
+/// 任一步失败仅记日志，不阻塞启动。追溯 TC-031/033/034。
+pub fn switch_default_mic_to_cable_on_startup(app: &AppHandle) {
+    if !device_enum::detect_virtual_cable() {
+        return; // 无 CABLE，不动系统设置（TC-034）
+    }
+    if device_enum::default_mic_is_cable() {
+        log::info!(target: "mic", "默认麦克风已是 CABLE，跳过切换（保留既有记录）");
+        return; // TC-033：不重复切换，保留记录供退出回切
+    }
+    let Some(orig) = device_enum::get_default_capture_id() else {
+        log::warn!(target: "mic", "无法获取当前默认输入设备，跳过记录");
+        return;
+    };
+    save_original_mic(app, &orig);
+    match device_enum::find_cable_capture_id() {
+        Some(cable) => match device_enum::set_default_capture_device(&cable) {
+            Ok(()) => log::info!(target: "mic", "默认麦克风已切到 CABLE（原设备已记录）"),
+            Err(e) => log::warn!(target: "mic", "切换默认麦克风到 CABLE 失败（记录保留）: {e}"),
+        },
+        None => log::warn!(target: "mic", "未找到 CABLE 采集端点，跳过切换"),
+    }
+}
+
+/// 退出钩子：有原设备记录且 CABLE 在线时切回，成功后才清记录。追溯 TC-032/034。
+pub fn restore_default_mic_on_exit(app: &AppHandle) {
+    let saved = load_original_mic(app);
+    let cable_exists = device_enum::detect_virtual_cable();
+    if !device_enum::should_restore_mic(saved.as_deref(), cable_exists) {
+        return;
+    }
+    let orig = saved.expect("should_restore_mic 已保证有记录");
+    match device_enum::set_default_capture_device(&orig) {
+        Ok(()) => {
+            clear_original_mic(app);
+            log::info!(target: "mic", "默认麦克风已切回原设备，记录已清空");
+        }
+        Err(e) => log::error!(target: "mic", "回切默认麦克风失败（记录保留，下次启动重试）: {e}"),
+    }
+}
+
 /// 前端日志通道：Vue 侧异常经此落盘（target=frontend）
 #[tauri::command]
 pub fn write_log(level: String, message: String) {
@@ -201,6 +305,44 @@ pub fn write_log(level: String, message: String) {
         "warn" => log::warn!(target: "frontend", "{message}"),
         _ => log::info!(target: "frontend", "{message}"),
     }
+}
+
+/// 读取收藏列表（第2期 P2）：返回小写 exe 列表。追溯 TC-035。
+#[tauri::command]
+pub fn get_favorites(app: AppHandle) -> Vec<String> {
+    let mut list: Vec<String> = ENGINE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|e| e.favorites.iter().cloned().collect())
+        .unwrap_or_default();
+    list.sort();
+    list
+}
+
+/// 收藏/取消收藏（第2期 P2）：改内存+文件，emit favorites_changed 同步前端星标。追溯 TC-035。
+#[tauri::command]
+pub fn set_favorite(app: AppHandle, exe: String, on: bool) {
+    let exe = exe.to_lowercase();
+    {
+        let mut eng = ENGINE.lock().unwrap();
+        if let Some(e) = eng.as_mut() {
+            if on {
+                e.favorites.insert(exe.clone());
+            } else {
+                e.favorites.remove(&exe);
+            }
+        }
+    }
+    let favorites: HashSet<String> = ENGINE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|e| e.favorites.clone())
+        .unwrap_or_default();
+    save_favorites(&app, &favorites);
+    let _ = app.emit("favorites_changed", &favorites);
+    log::info!(target: "fav", "收藏更新: exe={exe} on={on}");
 }
 
 pub fn init_engine(app: AppHandle) {
@@ -218,6 +360,8 @@ pub fn init_engine(app: AppHandle) {
                 e.master_on = cfg.master_on;
                 e.mic_id = cfg.mic;
             }
+            // 收藏应用自动共享名单（第2期 P2）：启动即载入
+            e.favorites = load_favorites(&app);
             *eng = Some(e);
         }
     }
@@ -313,6 +457,7 @@ pub fn get_status() -> AppStatus {
         master_on: e.master_on,
         onboarding_done: e.onboarding_done,
         mic_id: e.mic_id.clone(),
+        output_muted: e.output_muted,
         shared: e
             .sources
             .iter()
@@ -337,6 +482,9 @@ pub async fn toggle_share(app: AppHandle, pid: u32, exe: String, enable: bool) -
                     // 源已存在，重新启用共享
                     log::info!(target: "share", "重新启用共享 pid={pid} exe={exe}");
                     st.shared = true;
+                    st.silent_ticks = 0;
+                    // 第3期 TC-059：重新启用共享同步悬浮窗图标
+                    let _ = app.emit("shared_changed", vec![(pid, true)]);
                     return Ok(());
                 }
             }
@@ -352,6 +500,7 @@ pub async fn toggle_share(app: AppHandle, pid: u32, exe: String, enable: bool) -
         let e = eng.as_mut().expect("engine not initialized");
         if e.sources.contains_key(&pid) {
             // 并发重复勾选：新捕获随 drop 停止
+            let _ = app.emit("shared_changed", vec![(pid, true)]);
             return Ok(());
         }
         e.sources.insert(
@@ -362,6 +511,9 @@ pub async fn toggle_share(app: AppHandle, pid: u32, exe: String, enable: bool) -
                 consumer,
                 level: 0.0,
                 shared: true,
+                playing_ticks: 0,
+                silent_ticks: 0,
+                auto_shared: false,
             },
         );
         e.gains.add(pid);
@@ -372,9 +524,18 @@ pub async fn toggle_share(app: AppHandle, pid: u32, exe: String, enable: bool) -
         let mut eng = ENGINE.lock().unwrap();
         let e = eng.as_mut().expect("engine not initialized");
         if let Some(st) = e.sources.get_mut(&pid) {
+            if st.auto_shared {
+                // 用户手动取消自动共享的应用：本次会话不再自动重开（TC-038）
+                e.auto_opt_out.insert(st.exe.to_lowercase());
+                st.auto_shared = false;
+                log::info!(target: "fav", "用户手动取消自动共享，本会话不再自动重开 exe={}", st.exe);
+            }
+            st.playing_ticks = 0;
             st.shared = false;
         }
     }
+    // 第3期 TC-059：主界面手动勾选/取消 → 悬浮窗共享图标实时同步
+    let _ = app.emit("shared_changed", vec![(pid, enable)]);
     Ok(())
 }
 
@@ -440,7 +601,12 @@ fn mixer_loop_with_stop(app: AppHandle, stop: Arc<Mutex<bool>>) {
         };
         let mut refs: Vec<(&[f32], f32)> = buffers.iter().map(|b| (b.as_slice(), 1.0f32)).collect();
         refs.push((mic_buf.as_slice(), 1.0f32));
-        let mut out = mix(&refs);
+        // 闭麦（第3期 TC-053）：mix 后整帧清零，对方听不到音乐+人声；共享状态不变
+        let muted = {
+            let eng = ENGINE.lock().unwrap();
+            eng.as_ref().map(|e| e.output_muted).unwrap_or(false)
+        };
+        let mut out = finalize_output(mix(&refs), muted);
         // 补零至整周期：即使源全部静音也持续填充，渲染端无 underflow 间隙
         out.resize(need, 0.0);
         let _ = sink.write(&out);
@@ -463,6 +629,8 @@ fn mixer_loop_with_stop(app: AppHandle, stop: Arc<Mutex<bool>>) {
             cleanup_dead_sources();
             // 自动为检测到的新音频会话创建监控源（shared=false，仅监控不混音）
             ensure_monitoring();
+            // 收藏应用自动共享检测（第2期 P2）：复用监控流电平，零额外 WASAPI 调用
+            auto_share_favorites(&app);
         }
     }
 }
@@ -522,6 +690,9 @@ fn ensure_monitoring() {
                                 consumer,
                                 level: 0.0,
                                 shared: false, // 仅监控，不参与混音
+                                playing_ticks: 0,
+                                silent_ticks: 0,
+                                auto_shared: false,
                             },
                         );
                         e.gains.add(app_info.pid);
@@ -550,6 +721,147 @@ pub fn set_volume(pid: u32, volume: u8) {
     }
 }
 
+// ---------- 收藏应用自动共享（第2期 P2）：电平驱动判定纯函数（TDD） ----------
+
+/// 播放判定阈值（RMS，与前端电平条同量级）
+const PLAY_THRESHOLD: f32 = 0.005;
+/// 连续静音 tick 数判定停止（混音循环每 tick ~2s，即 ~6s 缓冲）
+const SILENT_TICKS_STOP: u32 = 3;
+/// 连续高电平 tick 数判定播放（~4s，防瞬时噪声）
+const PLAY_TICKS_START: u32 = 2;
+
+/// 播放触发判定（纯函数，TDD）：高电平且连续高电平 tick 达标才自动开启共享。追溯 TC-036/040。
+pub fn should_auto_start(level: f32, playing_ticks: u32) -> bool {
+    level > PLAY_THRESHOLD && playing_ticks >= PLAY_TICKS_START
+}
+
+/// 停止触发判定（纯函数，TDD）：静音且连续静音 tick 达标才自动取消共享。追溯 TC-037。
+pub fn should_auto_stop(level: f32, silent_ticks: u32) -> bool {
+    level <= PLAY_THRESHOLD && silent_ticks >= SILENT_TICKS_STOP
+}
+
+/// 播放 tick 累计（纯函数，TDD）：高电平则 +1，否则清零。
+pub fn next_playing_ticks(level: f32, playing_ticks: u32) -> u32 {
+    if level > PLAY_THRESHOLD {
+        playing_ticks.saturating_add(1)
+    } else {
+        0
+    }
+}
+
+/// 静音 tick 累计（纯函数，TDD）：静音则 +1，否则清零。
+pub fn next_silent_ticks(level: f32, silent_ticks: u32) -> u32 {
+    if level <= PLAY_THRESHOLD {
+        silent_ticks.saturating_add(1)
+    } else {
+        0
+    }
+}
+
+/// 收藏 exe 归一化：小写 + 去重 + 排序（持久化与比较统一口径，与 list_audio_apps 归并键一致）
+pub fn normalize_favorite_exes(exes: Vec<String>) -> Vec<String> {
+    exes.into_iter()
+        .map(|e| e.to_lowercase())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+// ---------- 收藏应用自动共享持久化：favorites.json（第2期 P2） ----------
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FavoritesConfig {
+    exes: Vec<String>,
+}
+
+const FAVORITES_FILE: &str = "favorites.json";
+
+fn favorites_path(app: &AppHandle) -> Option<std::path::PathBuf> {
+    crate::data_dir(app).map(|d| d.join(FAVORITES_FILE))
+}
+
+/// 读取收藏（小写 exe 集合）；文件缺失/解析失败回退空集（容错模式，同 remember.json）
+fn load_favorites(app: &AppHandle) -> HashSet<String> {
+    let Some(p) = favorites_path(app) else {
+        return HashSet::new();
+    };
+    let Ok(raw) = std::fs::read_to_string(&p) else {
+        return HashSet::new(); // 首次运行无收藏，属正常
+    };
+    match serde_json::from_str::<FavoritesConfig>(&raw) {
+        Ok(c) => c.exes.into_iter().map(|e| e.to_lowercase()).collect(),
+        Err(e) => {
+            log::warn!(target: "fav", "favorites.json 解析失败，忽略收藏: {e}");
+            HashSet::new()
+        }
+    }
+}
+
+/// 覆盖写入收藏（归一化后落盘）
+fn save_favorites(app: &AppHandle, exes: &HashSet<String>) {
+    let Some(p) = favorites_path(app) else { return };
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let cfg = FavoritesConfig {
+        exes: normalize_favorite_exes(exes.iter().cloned().collect()),
+    };
+    if let Err(e) = serde_json::to_string_pretty(&cfg)
+        .map_err(|e| e.to_string())
+        .and_then(|s| std::fs::write(&p, s).map_err(|e| e.to_string()))
+    {
+        log::error!(target: "fav", "favorites.json 写入失败: {e}");
+    }
+}
+
+/// 收藏应用自动共享检测（第2期 P2）：混音循环每 100 tick 调用一次。
+/// 只翻转 shared 标记（复用 ensure_monitoring 已建捕获），不重建捕获、不走 toggle_share。
+/// 追溯 TC-036/037/038/039/040。
+fn auto_share_favorites(app: &AppHandle) {
+    let changed: Vec<(u32, bool)> = {
+        let mut eng = ENGINE.lock().unwrap();
+        let Some(e) = eng.as_mut() else { return };
+        let mut changed = Vec::new();
+        for (pid, st) in e.sources.iter_mut() {
+            let exe = st.exe.to_lowercase();
+            // 仅收藏且未进入会话级退出名单的应用参与自动共享（TC-038/039）
+            if !e.favorites.contains(&exe) || e.auto_opt_out.contains(&exe) {
+                continue;
+            }
+            let level = st.level;
+            if !st.shared {
+                st.playing_ticks = next_playing_ticks(level, st.playing_ticks);
+                if should_auto_start(level, st.playing_ticks) {
+                    st.shared = true;
+                    st.auto_shared = true;
+                    st.silent_ticks = 0;
+                    // 与手动共享一致：首次自动共享默认 80% 音量，避免 gain 落到混音循环 unwrap_or(1.0)
+                    if !e.volumes.contains_key(pid) {
+                        e.gains.add(*pid);
+                        e.gains.set_gain(*pid, 0.8);
+                        e.volumes.insert(*pid, 80);
+                    }
+                    changed.push((*pid, true));
+                    log::info!(target: "fav", "收藏应用自动开始共享 pid={pid} exe={exe} level={level:.4}");
+                }
+            } else if st.auto_shared {
+                st.silent_ticks = next_silent_ticks(level, st.silent_ticks);
+                if should_auto_stop(level, st.silent_ticks) {
+                    st.shared = false;
+                    st.auto_shared = false;
+                    st.playing_ticks = 0;
+                    changed.push((*pid, false));
+                    log::info!(target: "fav", "收藏应用停止播放，自动取消共享 pid={pid} exe={exe}");
+                }
+            }
+        }
+        changed
+    };
+    if !changed.is_empty() {
+        // 前端据此同步勾选状态（AppList 勾选点亮/熄灭）
+        let _ = app.emit("shared_changed", &changed);
+    }
+}
+
 #[tauri::command]
 pub async fn set_mic(device_id: String) -> Result<(), String> {
     // TC-008：切换麦克风不断流——仅重建 MicCapture，应用源与写出不动。
@@ -574,10 +886,163 @@ pub async fn set_mic(device_id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn toggle_master(on: bool) {
-    let mut eng = ENGINE.lock().unwrap();
-    if let Some(e) = eng.as_mut() {
-        e.master_on = on;
+pub fn toggle_master(app: AppHandle, on: bool) {
+    {
+        let mut eng = ENGINE.lock().unwrap();
+        if let Some(e) = eng.as_mut() {
+            e.master_on = on;
+        }
+    }
+    // 同步所有入口（UI 开关/热键/托盘）并刷新托盘文案（TC-018/TC-022）；锁外执行
+    let _ = app.emit("master_changed", on);
+    crate::rebuild_tray_menu(&app, on);
+}
+
+/// 读取当前总开关状态（热键/托盘动作分发用，非命令）
+pub fn master_on() -> bool {
+    let eng = ENGINE.lock().unwrap();
+    eng.as_ref().map(|e| e.master_on).unwrap_or(false)
+}
+
+/// 一键闭麦（第3期 TC-053/058）：输出全静音（对方听不到音乐+人声）；
+/// 不改变共享状态、不持久化，重启复位。悬浮窗 🎤 按钮调用。
+#[tauri::command]
+pub fn set_output_mute(app: AppHandle, on: bool) {
+    {
+        let mut eng = ENGINE.lock().unwrap();
+        if let Some(e) = eng.as_mut() {
+            e.output_muted = on;
+        }
+    }
+    let _ = app.emit("output_mute_changed", on);
+    log::info!(target: "app", "输出闭麦: {on}");
+}
+
+/// 全局媒体播放/暂停（第2期 P2）：与热键 Ctrl+Shift+P、托盘"播放/暂停音乐"同一入口函数。追溯 TC-041/042/043/044。
+#[tauri::command]
+pub fn media_play_pause() {
+    hotkeys::media_play_pause();
+}
+
+// ---------- 热键配置命令（TC-020 自定义改键 / TC-021 冲突回滚） ----------
+
+/// 读取热键配置（前端设置面板与提醒行展示用）
+#[tauri::command]
+pub fn get_hotkeys(app: AppHandle) -> HotkeyConfig {
+    hotkeys::load_config(&app)
+}
+
+/// 保存热键配置：全量格式校验 → 注销旧 → 注册新（失败回滚）→ 落盘 → 通知前端
+#[tauri::command]
+pub fn set_hotkeys(app: AppHandle, cfg: HotkeyConfig) -> Result<(), String> {
+    // 1. 全量格式校验（空串=禁用，跳过校验）
+    for (label, s) in [
+        ("toggle_share", &cfg.toggle_share),
+        ("play_pause", &cfg.play_pause),
+        ("prev_track", &cfg.prev_track),
+        ("next_track", &cfg.next_track),
+    ] {
+        if !s.is_empty() && hotkeys::parse_shortcut(s).is_none() {
+            return Err(format!("组合键格式无效: {label}={s}"));
+        }
+    }
+    // 2. 注销旧并注册新；任一条失败 → 回滚旧配置并报错，不落盘
+    let _ = app.global_shortcut().unregister_all();
+    for s in [&cfg.toggle_share, &cfg.play_pause, &cfg.prev_track, &cfg.next_track] {
+        let Some(sc) = hotkeys::parse_shortcut(s) else {
+            continue;
+        };
+        if let Err(e) = app.global_shortcut().register(sc) {
+            log::error!(target: "hotkey", "set_hotkeys 注册失败（可能被其它程序占用）: {s} {e}");
+            hotkeys::register_all(&app); // 回滚：按旧配置重新注册
+            return Err(format!("注册失败，组合可能已被其它程序占用: {s}"));
+        }
+    }
+    // 3. 落盘 + 通知前端刷新
+    hotkeys::save_config(&app, &cfg);
+    let _ = app.emit("hotkeys_changed", &cfg);
+    Ok(())
+}
+
+/// 录制模式：true 注销全部热键（已注册热键会拦截 keydown，面板收不到按键），
+/// false 按当前配置恢复注册（TC-020 按键捕获录制的关键前置）
+#[tauri::command]
+pub fn set_hotkeys_recording(app: AppHandle, on: bool) {
+    if on {
+        let _ = app.global_shortcut().unregister_all();
+        log::info!(target: "hotkey", "进入录制模式：热键已全部注销");
+    } else {
+        hotkeys::register_all(&app);
+    }
+}
+
+#[cfg(test)]
+mod master_tests {
+    use super::*;
+
+    /// TC-018：引擎初始 master_on=false；翻转后 master_on() 同步可见
+    #[test]
+    fn master_default_off_and_flip() {
+        {
+            let mut eng = ENGINE.lock().unwrap();
+            *eng = Some(Engine::new());
+            assert!(!eng.as_ref().unwrap().master_on, "初始应为关闭");
+        }
+        assert!(!master_on());
+        {
+            let mut eng = ENGINE.lock().unwrap();
+            eng.as_mut().unwrap().master_on = true;
+        }
+        assert!(master_on());
+        {
+            let mut eng = ENGINE.lock().unwrap();
+            eng.as_mut().unwrap().master_on = false;
+        }
+        assert!(!master_on());
+    }
+}
+
+#[cfg(test)]
+mod auto_share_tests {
+    use super::*;
+
+    /// TC-036/040：高电平且连续高电平 tick 达标才触发（严格大于阈值）
+    #[test]
+    fn auto_start_needs_level_and_ticks() {
+        assert!(!should_auto_start(0.004, 2)); // 低电平不触发
+        assert!(should_auto_start(0.006, 2)); // 高电平 + 2 tick 触发
+        assert!(!should_auto_start(0.006, 1)); // 高电平但 tick 不足
+        assert!(should_auto_start(0.006, 3)); // 更高 tick 也触发
+        assert!(!should_auto_start(0.005, 2)); // 恰等于阈值不触发（> 判定）
+    }
+
+    /// TC-037：静音且连续静音 tick 达标才停止（<= 阈值视为静音）
+    #[test]
+    fn auto_stop_needs_silence_and_ticks() {
+        assert!(should_auto_stop(0.004, 3)); // 静音 + 3 tick 停止
+        assert!(!should_auto_stop(0.004, 2)); // tick 不足
+        assert!(!should_auto_stop(0.006, 3)); // 高电平不停止
+        assert!(should_auto_stop(0.005, 3)); // 恰等于阈值视为静音（<=）
+    }
+
+    /// tick 累计：对应电平累加、反向电平清零
+    #[test]
+    fn ticks_accumulate_and_reset() {
+        assert_eq!(next_playing_ticks(0.006, 0), 1);
+        assert_eq!(next_playing_ticks(0.006, 1), 2);
+        assert_eq!(next_playing_ticks(0.004, 5), 0); // 低电平清零
+        assert_eq!(next_silent_ticks(0.004, 0), 1);
+        assert_eq!(next_silent_ticks(0.004, 2), 3);
+        assert_eq!(next_silent_ticks(0.006, 2), 0); // 高电平清零
+    }
+
+    /// TC-035：收藏 exe 归一化（小写 + 去重 + 排序），与 list_audio_apps 归并键一致
+    #[test]
+    fn favorite_exes_normalize_lowercase_dedup_sort() {
+        assert_eq!(
+            normalize_favorite_exes(vec!["B.EXE".into(), "a.exe".into(), "b.exe".into(), "A.EXE".into()]),
+            vec!["a.exe", "b.exe"]
+        );
     }
 }
 
@@ -685,6 +1150,8 @@ pub fn get_version() -> String {
 pub fn quit_app(app: AppHandle) {
     // 退出前覆盖写入记住选择配置（须在移走 Engine 之前，否则读不到共享列表）
     save_remember_config(&app);
+    // 第2期 P1：回切默认麦克风，确保切回原麦克风后才结束进程
+    restore_default_mic_on_exit(&app);
     log::info!(target: "app", "AudioShare 退出");
     log::logger().flush();
     // 退出死锁修复：不能在持有 ENGINE 锁时 join 混音线程——

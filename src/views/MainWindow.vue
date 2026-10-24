@@ -4,11 +4,13 @@
  */
 import { onMounted, ref, watch } from 'vue'
 import { listen } from '@tauri-apps/api/event'
+import { invoke } from '@tauri-apps/api/core'
 import { check } from '@tauri-apps/plugin-updater'
-import { store, initStore, toggleMaster, quitApp } from '../stores/app'
+import { store, initStore, toggleMaster, quitApp, setFloatEnabled } from '../stores/app'
 import AppList from '../components/AppList.vue'
 import MicSelect from '../components/MicSelect.vue'
 import Onboarding from '../components/Onboarding.vue'
+import SettingsPanel from '../components/SettingsPanel.vue'
 
 // 更新状态
 const updateStatus = ref<'idle' | 'checking' | 'available' | 'downloading' | 'installing' | 'latest' | 'error'>('idle')
@@ -20,6 +22,20 @@ const updateError = ref('')
 function closeUpdateToast() {
   updateStatus.value = 'idle'
   updateProgress.value = 0
+}
+
+/** 全部暂停/播放（第2期 P2）：透传媒体键，与热键 Ctrl+Shift+P / 托盘完全一致 */
+function pauseAllAudio() {
+  invoke('media_play_pause').catch((e) => console.warn('media_play_pause 失败', e))
+}
+
+/** 悬浮窗开关（第3期 TC-046，位于设置按钮旁）：乐观更新，后端失败回滚 */
+async function onFloatToggle() {
+  try {
+    await setFloatEnabled(!store.floatEnabled)
+  } catch (e) {
+    console.warn('set_float_enabled 失败', e)
+  }
 }
 
 // 自动关闭：已是最新 / 出错 3 秒后自动隐藏
@@ -69,6 +85,12 @@ onMounted(async () => {
   <div class="app">
     <div class="titlebar">
       <button class="wizard-btn" @click="store.showOnboarding = true">配置向导</button>
+      <button class="wizard-btn ghost" @click="store.showSettings = true">设置</button>
+      <span class="float-toggle" :title="store.floatEnabled ? '点击隐藏悬浮窗' : '点击显示悬浮窗'">
+        <span class="float-toggle-lab">悬浮窗</span>
+        <button class="switch" role="switch" :aria-checked="store.floatEnabled"
+          aria-label="显示悬浮窗" @click="onFloatToggle" />
+      </span>
       <span class="state">
         <span class="dot" :class="store.cableInstalled ? 'ok' : 'err'" />
         <span>{{ store.cableInstalled ? '虚拟麦克风就绪' : '虚拟麦克风不可用' }}</span>
@@ -91,9 +113,29 @@ onMounted(async () => {
         aria-label="共享总开关" @click="toggleMaster(!store.masterOn)" />
     </div>
 
+    <!-- 热键常驻提醒（TC-023）：仅展示当前快捷键配置 -->
+    <div class="card hotkey-hint">
+      <div class="hk-line">
+        <b>快捷键</b>
+        <span class="hk" :class="{ off: !store.hotkeys.toggle_share }">{{ store.hotkeys.toggle_share || '未设置' }}</span>开关共享
+        <span class="sep">·</span>
+        <span class="hk" :class="{ off: !store.hotkeys.play_pause }">{{ store.hotkeys.play_pause || '未设置' }}</span>播放/暂停
+      </div>
+      <div class="hk-line">
+        <b class="invis">快捷键</b>
+        <span class="hk" :class="{ off: !store.hotkeys.prev_track }">{{ store.hotkeys.prev_track || '未设置' }}</span>上一首
+        <span class="sep">·</span>
+        <span class="hk" :class="{ off: !store.hotkeys.next_track }">{{ store.hotkeys.next_track || '未设置' }}</span>下一首
+      </div>
+    </div>
+
     <!-- 应用列表（含所有音频会话程序） -->
     <div class="card">
-      <label class="fieldlab">应用列表</label>
+      <div class="card-head">
+        <label class="fieldlab">应用列表</label>
+        <button class="pause-all-btn" title="暂停/播放所有音频（与热键 Ctrl+Shift+P 一致）"
+          @click="pauseAllAudio">⏯ 全部暂停</button>
+      </div>
       <AppList />
     </div>
 
@@ -110,6 +152,7 @@ onMounted(async () => {
     </div>
 
     <Onboarding v-if="store.showOnboarding" @close="store.showOnboarding = false" />
+    <SettingsPanel v-if="store.showSettings" @close="store.showSettings = false" />
 
     <!-- 更新状态提示 -->
     <div v-if="updateStatus !== 'idle'" class="update-toast">
@@ -142,6 +185,11 @@ body { overflow: hidden; }
 .titlebar { display: flex; align-items: center; gap: 8px; padding: 0 2px 8px; flex-shrink: 0; }
 .wizard-btn { border: 1px solid #0067c0; border-radius: 4px; padding: 4px 12px; font-size: 12px; cursor: pointer; background: #0067c0; color: #fff; font-family: inherit; }
 .wizard-btn:hover { background: #1975c5; }
+.wizard-btn.ghost { background: transparent; color: #0067c0; }
+.wizard-btn.ghost:hover { background: #e5f1fb; }
+/* 悬浮窗开关（第3期 TC-046：设置按钮旁常驻入口，复用 .switch 全局样式） */
+.float-toggle { display: flex; align-items: center; gap: 5px; }
+.float-toggle-lab { font-size: 10.5px; color: #5d5d5d; }
 .titlebar .state { margin-left: auto; font-size: 12px; color: #5d5d5d; display: flex; align-items: center; gap: 6px; }
 .dot { width: 7px; height: 7px; border-radius: 50%; }
 .dot.ok { background: #0f7b0f; }
@@ -149,6 +197,14 @@ body { overflow: hidden; }
 .master { display: flex; align-items: center; gap: 12px; }
 .master .lab { flex: 1; }
 .master .lab b { font-size: 13px; font-weight: 600; }
+/* 热键常驻提醒（TC-023）：两行紧凑展示，仅展示不响应点击 */
+.hotkey-hint { padding: 6px 10px; }
+.hk-line { display: flex; align-items: center; gap: 5px; font-size: 10.5px; color: #5d5d5d; line-height: 1.6; }
+.hk-line b { font-weight: 600; }
+.hk-line b.invis { visibility: hidden; }
+.hk { color: #1b1b1b; background: #ececec; border-radius: 3px; padding: 0 5px; font-size: 10px; }
+.hk.off { color: #8a8a8a; background: #f3f3f3; }
+.sep { color: #c8c8c8; }
 .switch { position: relative; width: 40px; height: 20px; border-radius: 10px; background: transparent; border: 1px solid #d6d6d6; cursor: pointer; transition: .15s; flex-shrink: 0; }
 .switch::after { content: ""; position: absolute; top: 3px; left: 3px; width: 12px; height: 12px; border-radius: 50%; background: #5d5d5d; transition: .15s; }
 .switch[aria-checked="true"] { background: #0067c0; border-color: #0067c0; }
@@ -165,6 +221,11 @@ body { overflow: hidden; }
 .footnote.quit { margin-top: auto; }
 .footnote a { color: #8a8a8a; }
 .fieldlab { font-size: 11px; color: #5d5d5d; margin-bottom: 5px; display: block; }
+.card-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 5px; }
+.card-head .fieldlab { margin-bottom: 0; }
+.pause-all-btn { border: 1px solid #0067c0; border-radius: 4px; padding: 2px 8px; font-size: 11px; cursor: pointer; background: transparent; color: #0067c0; font-family: inherit; }
+.pause-all-btn:hover { background: #e5f1fb; }
+.pause-all-btn:focus-visible { outline: 2px solid #0067c0; outline-offset: 2px; }
 .update-toast { position: fixed; bottom: 40px; left: 50%; transform: translateX(-50%); background: #1b1b1b; color: #fff; padding: 8px 12px 8px 16px; border-radius: 6px; font-size: 12px; white-space: nowrap; z-index: 100; box-shadow: 0 2px 8px rgba(0,0,0,.2); display: flex; align-items: center; gap: 10px; }
 .update-close { background: none; border: none; color: #aaa; cursor: pointer; font-size: 14px; padding: 0 2px; line-height: 1; }
 .update-close:hover { color: #fff; }
