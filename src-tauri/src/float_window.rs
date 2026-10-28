@@ -29,11 +29,16 @@ fn is_main_thread() -> bool {
 
 /// 吸附阈值（物理像素，PRD FR-010/011：边缘 ≤20px 自动吸附）
 pub const SNAP_THRESHOLD: f64 = 20.0;
-/// 悬浮窗尺寸（物理像素，PRD FR-001）
-pub const SIZE_HORIZONTAL: (f64, f64) = (232.0, 44.0);
-pub const SIZE_VERTICAL: (f64, f64) = (44.0, 232.0);
-/// ⠿ 拖动滑块中心距布局端部的偏移（物理像素，padding 6 + 滑块宽 28 / 2，两布局一致）
-pub const SLIDER_AXIS_OFFSET: f64 = 20.0;
+/// 悬浮窗尺寸（物理像素，PRD FR-001/FR-020；由《悬浮窗美化方案》3.4 控件规格推导）
+/// 水平：边框 2 + padding 16 + 手柄 16 + 间隙 4 + 旋转 24 + 间隙 8 + 开关 30
+///       + 间隙 10 + 图标 68 + 间隙 10 + 功能组 111 = 299 ≤ 300
+pub const SIZE_HORIZONTAL: (f64, f64) = (300.0, 44.0);
+/// 垂直：边框 2 + padding 16 + 手柄 16 + 间隙 4 + 旋转 24 + 间隙 8 + 开关 18
+///       + 间隙 10 + 图标 68 + 间隙 10 + 功能组 111 = 287 ≤ 288
+/// 宽度 48 的由来：垂直态最宽控件为共享开关 30px → 30 + padding 16 + 边框 2 = 48
+pub const SIZE_VERTICAL: (f64, f64) = (48.0, 288.0);
+/// ⠿ 拖动手柄中心距布局端部的偏移（物理像素，padding 8 + 手柄宽 16 / 2，两布局一致）
+pub const SLIDER_AXIS_OFFSET: f64 = 16.0;
 /// 配置文件名（%APPDATA%\AudioShare\）
 const FLOAT_WINDOW_FILE: &str = "float_window.json";
 
@@ -89,6 +94,18 @@ pub struct SnapResult {
     pub x: f64,
     pub y: f64,
     pub orientation: Orientation,
+    /// 目标宽（物理像素）：前端 setSize 直接使用，避免前后端两处硬编码尺寸漂移
+    pub w: f64,
+    /// 目标高（物理像素）
+    pub h: f64,
+}
+
+/// 布局方向 → 窗口尺寸（物理像素）
+pub fn size_of(o: Orientation) -> (f64, f64) {
+    match o {
+        Orientation::Horizontal => SIZE_HORIZONTAL,
+        Orientation::Vertical => SIZE_VERTICAL,
+    }
 }
 
 /// 解析布局方向："vertical"→Vertical，其余（含空串/非法）→Horizontal
@@ -114,18 +131,21 @@ pub fn snap_to_edge(rect: Rect, work: Rect, threshold: f64, current: Orientation
     let d_r = work.w - (rect.x + rect.w);
     let min = d_t.min(d_b).min(d_l).min(d_r);
     if min > threshold {
-        return SnapResult { x: rect.x, y: rect.y, orientation: current };
+        let (w, h) = size_of(current);
+        return SnapResult { x: rect.x, y: rect.y, orientation: current, w, h };
     }
     // 分支顺序即并列优先级：顶 > 底 > 左 > 右；贴底/贴右必须用目标布局尺寸
-    // （如垂直窗 232 高贴底 → 水平窗 44 高，若用 rect.h 会悬空 188px）
+    // （如垂直窗 288 高贴底 → 水平窗 44 高，若用 rect.h 会悬空 244px）
+    let (hw, hh) = size_of(Orientation::Horizontal);
+    let (vw, vh) = size_of(Orientation::Vertical);
     if d_t == min {
-        SnapResult { x: rect.x, y: 0.0, orientation: Orientation::Horizontal }
+        SnapResult { x: rect.x, y: 0.0, orientation: Orientation::Horizontal, w: hw, h: hh }
     } else if d_b == min {
-        SnapResult { x: rect.x, y: work.h - SIZE_HORIZONTAL.1, orientation: Orientation::Horizontal }
+        SnapResult { x: rect.x, y: work.h - hh, orientation: Orientation::Horizontal, w: hw, h: hh }
     } else if d_l == min {
-        SnapResult { x: 0.0, y: rect.y, orientation: Orientation::Vertical }
+        SnapResult { x: 0.0, y: rect.y, orientation: Orientation::Vertical, w: vw, h: vh }
     } else {
-        SnapResult { x: work.w - SIZE_VERTICAL.0, y: rect.y, orientation: Orientation::Vertical }
+        SnapResult { x: work.w - vw, y: rect.y, orientation: Orientation::Vertical, w: vw, h: vh }
     }
 }
 
@@ -140,16 +160,33 @@ pub fn clamp_to_work_area(x: f64, y: f64, w: f64, h: f64, work: Rect) -> (f64, f
 /// （水平→垂直：贴边轴 x 不变，补偿 y；垂直→水平：贴边轴 y 不变，补偿 x）
 pub fn anchor_adjust(rect: Rect, mut r: SnapResult, current: Orientation, work: Rect) -> SnapResult {
     if r.orientation == current {
-        return r;
+        let (w, h) = size_of(r.orientation);
+        return SnapResult { x: r.x, y: r.y, orientation: r.orientation, w, h };
     }
     if r.orientation == Orientation::Vertical {
-        // 水平滑块中心 y = rect.y + rect.h/2（垂直居中）；垂直布局滑块中心 = r.y + SLIDER_AXIS_OFFSET
-        r.y = (rect.y + rect.h / 2.0 - SLIDER_AXIS_OFFSET).clamp(0.0, work.h - SIZE_VERTICAL.1);
+        // 水平手柄中心 y = rect.y + rect.h/2（垂直居中）；垂直布局手柄中心 = r.y + SLIDER_AXIS_OFFSET
+        let max_y = (work.h - size_of(Orientation::Vertical).1).max(0.0);
+        r.y = (rect.y + rect.h / 2.0 - SLIDER_AXIS_OFFSET).clamp(0.0, max_y);
     } else {
-        // 垂直滑块中心 x = rect.x + rect.w/2（水平居中）；水平布局滑块中心 = r.x + SLIDER_AXIS_OFFSET
-        r.x = (rect.x + rect.w / 2.0 - SLIDER_AXIS_OFFSET).clamp(0.0, work.w - SIZE_HORIZONTAL.0);
+        // 垂直手柄中心 x = rect.x + rect.w/2（水平居中）；水平布局手柄中心 = r.x + SLIDER_AXIS_OFFSET
+        let max_x = (work.w - size_of(Orientation::Horizontal).0).max(0.0);
+        r.x = (rect.x + rect.w / 2.0 - SLIDER_AXIS_OFFSET).clamp(0.0, max_x);
     }
-    r
+    let (w, h) = size_of(r.orientation);
+    SnapResult { x: r.x, y: r.y, orientation: r.orientation, w, h }
+}
+
+/// 手动旋转布局（FR-016）：水平 ↔ 垂直
+/// 旋转中心 = ⠿ 拖动手柄中心（与边缘吸附触发的布局切换同一锚点），切换后 clamp 进工作区
+pub fn rotate_to(rect: Rect, current: Orientation, work: Rect) -> SnapResult {
+    let target = match current {
+        Orientation::Horizontal => Orientation::Vertical,
+        Orientation::Vertical => Orientation::Horizontal,
+    };
+    let raw = SnapResult { x: rect.x, y: rect.y, orientation: target, w: 0.0, h: 0.0 };
+    let adj = anchor_adjust(rect, raw, current, work);
+    let (cx, cy) = clamp_to_work_area(adj.x, adj.y, adj.w, adj.h, work);
+    SnapResult { x: cx, y: cy, orientation: adj.orientation, w: adj.w, h: adj.h }
 }
 
 // ---------- 配置持久化（TDD-T3） ----------
@@ -376,6 +413,16 @@ pub fn snap_float(app: AppHandle, x: f64, y: f64, w: f64, h: f64) -> Result<Snap
     Ok(anchor_adjust(rect, r, current, work))
 }
 
+/// 手动旋转布局（FR-016）：水平 ↔ 垂直
+/// 返回目标坐标与尺寸（物理像素），前端据此做 6 步插值过渡并落盘
+#[tauri::command]
+pub fn rotate_float(app: AppHandle, x: f64, y: f64, w: f64, h: f64) -> Result<SnapResult, String> {
+    let work = work_area_of_float_window(&app).ok_or("无法获取显示器工作区")?;
+    let rect = Rect { x, y, w, h };
+    let current = if w > h { Orientation::Horizontal } else { Orientation::Vertical };
+    Ok(rotate_to(rect, current, work))
+}
+
 /// 保存位置与方向（拖动/吸附后落盘；不改变 enabled）
 #[tauri::command]
 pub fn save_float_position(app: AppHandle, x: f64, y: f64, orientation: String) {
@@ -444,7 +491,7 @@ mod tests {
     fn snap_to_bottom_from_vertical_uses_target_height() {
         let work = work();
         // 垂直窗（44×232）底部距屏幕底 8px → 贴底 → 水平窗（232×44）底部必须贴齐
-        let r = snap_to_edge(Rect { x: 600.0, y: work.h - 232.0 - 8.0, w: 44.0, h: 232.0 }, work, SNAP_THRESHOLD, Orientation::Vertical);
+        let r = snap_to_edge(Rect { x: 600.0, y: work.h - 288.0 - 8.0, w: 48.0, h: 288.0 }, work, SNAP_THRESHOLD, Orientation::Vertical);
         assert_eq!(r.orientation, Orientation::Horizontal);
         assert_eq!(r.y, work.h - SIZE_HORIZONTAL.1); // 996 = 1040 - 44
     }
@@ -523,12 +570,12 @@ mod tests {
     /// 验收反馈：垂直→水平以 ⠿ 滑块为锚点，x 补偿使滑块中心不动（垂直贴左拖到顶，滑块中心 x=522 → 新 x=502）
     #[test]
     fn anchor_adjust_v_to_h_keeps_slider_center() {
-        let rect = Rect { x: 500.0, y: 5.0, w: 44.0, h: 232.0 };
+        let rect = Rect { x: 500.0, y: 5.0, w: 48.0, h: 288.0 };
         let r = snap_to_edge(rect, work(), SNAP_THRESHOLD, Orientation::Vertical);
         let r = anchor_adjust(rect, r, Orientation::Vertical, work());
         assert_eq!(r.orientation, Orientation::Horizontal);
         assert_eq!(r.y, 0.0); // 贴边轴不变
-        assert_eq!(r.x, 500.0 + 22.0 - SLIDER_AXIS_OFFSET); // 502.0
+        assert_eq!(r.x, 500.0 + 48.0 / 2.0 - SLIDER_AXIS_OFFSET); // 508.0
     }
 
     /// 验收反馈：锚点补偿后越界 → 收进工作区（靠近底部切换垂直布局）
@@ -568,11 +615,11 @@ mod tests {
     #[test]
     fn anchor_adjust_snap_bottom_no_misalignment() {
         let work = work();
-        let rect = Rect { x: 600.0, y: work.h - 232.0 - 8.0, w: 44.0, h: 232.0 };
+        let rect = Rect { x: 600.0, y: work.h - 288.0 - 8.0, w: 48.0, h: 288.0 };
         let r = snap_to_edge(rect, work, SNAP_THRESHOLD, Orientation::Vertical);
         let r = anchor_adjust(rect, r, Orientation::Vertical, work);
         assert_eq!(r.y, work.h - SIZE_HORIZONTAL.1); // 贴底：底边缘 work.h
-        assert_eq!(r.x, 600.0 + 22.0 - SLIDER_AXIS_OFFSET); // 滑块 x 中心不动
+        assert_eq!(r.x, 600.0 + 48.0 / 2.0 - SLIDER_AXIS_OFFSET); // 滑块 x 中心不动
     }
 
     /// 方向解析：vertical→垂直；horizontal/空串/非法→水平
@@ -582,6 +629,69 @@ mod tests {
         assert_eq!(parse_orientation("horizontal"), Orientation::Horizontal);
         assert_eq!(parse_orientation(""), Orientation::Horizontal);
         assert_eq!(parse_orientation("diagonal"), Orientation::Horizontal);
+    }
+
+    /// 布局方向 → 尺寸：与《悬浮窗美化方案》3.4 控件规格一致
+    #[test]
+    fn size_of_matches_design_spec() {
+        assert_eq!(size_of(Orientation::Horizontal), (300.0, 44.0));
+        assert_eq!(size_of(Orientation::Vertical), (48.0, 288.0));
+    }
+
+    // ---------- T5：手动旋转（FR-016） ----------
+
+    /// 水平 → 垂直：⠿ 手柄中心保持不动（水平 y 中心 = 400+22=422 → 垂直 r.y+16=422）
+    #[test]
+    fn rotate_to_horizontal_to_vertical_keeps_grip_center() {
+        let rect = Rect { x: 600.0, y: 400.0, w: 300.0, h: 44.0 };
+        let r = rotate_to(rect, Orientation::Horizontal, work());
+        assert_eq!(r.orientation, Orientation::Vertical);
+        assert_eq!(r.w, SIZE_VERTICAL.0);
+        assert_eq!(r.h, SIZE_VERTICAL.1);
+        assert_eq!(r.y, 400.0 + 22.0 - SLIDER_AXIS_OFFSET);
+        // 手柄中心不变量：422
+        assert_eq!(r.y + SLIDER_AXIS_OFFSET, 422.0);
+        assert_eq!(r.x, 600.0);
+    }
+
+    /// 垂直 → 水平：⠿ 手柄中心保持不动（垂直 x 中心 = 500+24=524 → 水平 r.x+16=524）
+    #[test]
+    fn rotate_to_vertical_to_horizontal_keeps_grip_center() {
+        let rect = Rect { x: 500.0, y: 100.0, w: 48.0, h: 288.0 };
+        let r = rotate_to(rect, Orientation::Vertical, work());
+        assert_eq!(r.orientation, Orientation::Horizontal);
+        assert_eq!(r.w, SIZE_HORIZONTAL.0);
+        assert_eq!(r.h, SIZE_HORIZONTAL.1);
+        assert_eq!(r.x, 500.0 + 48.0 / 2.0 - SLIDER_AXIS_OFFSET);
+        assert_eq!(r.x + SLIDER_AXIS_OFFSET, 524.0);
+        assert_eq!(r.y, 100.0);
+    }
+
+    /// 旋转后越界 → clamp 进工作区（转水平后右边缘对齐；底部越界则拉回）
+    /// 注：锚点补偿只作用于“变化轴”（V→H 补偿 x，y 保持不变），故 y 不自动贴底
+    #[test]
+    fn rotate_to_clamps_into_work_area() {
+        let work = work();
+        // 垂直窗位于右下角 → 转水平后右边缘贴齐，顶边位置保持
+        let rect = Rect { x: work.w - 48.0 - 20.0, y: work.h - 288.0 - 20.0, w: 48.0, h: 288.0 };
+        let r = rotate_to(rect, Orientation::Vertical, work);
+        assert_eq!(r.orientation, Orientation::Horizontal);
+        assert_eq!(r.x, work.w - SIZE_HORIZONTAL.0);
+        assert_eq!(r.y, work.h - 288.0 - 20.0);
+        // 旋转后底部越界 → 拉回工作区
+        let rect2 = Rect { x: 100.0, y: 1000.0, w: 48.0, h: 288.0 };
+        let r2 = rotate_to(rect2, Orientation::Vertical, work);
+        assert_eq!(r2.y, work.h - SIZE_HORIZONTAL.1);
+    }
+
+    /// 旋转目标尺寸始终与方向匹配（前端直接用 r.w/r.h 做 setSize）
+    #[test]
+    fn rotate_result_size_matches_orientation() {
+        let rect = Rect { x: 600.0, y: 400.0, w: 300.0, h: 44.0 };
+        let r = rotate_to(rect, Orientation::Horizontal, work());
+        assert_eq!((r.w, r.h), size_of(r.orientation));
+        let r2 = rotate_to(rect, Orientation::Vertical, work());
+        assert_eq!((r2.w, r2.h), size_of(r2.orientation));
     }
 
     // ---------- T3：配置持久化（纯 IO 测试） ----------

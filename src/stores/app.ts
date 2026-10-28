@@ -49,6 +49,7 @@ export const store = reactive({
   showSettings: false,                 // 设置面板显隐
   outputMuted: false,                  // 输出闭麦（第3期 TC-053，不持久化）
   floatEnabled: false,                 // 悬浮窗设置开关（第3期 TC-046）
+  floatOrientation: 'horizontal',      // 悬浮窗布局方向（第3期 TC-061，重启后按落盘方向恢复）
 })
 
 /** 前端日志通道：异常经后端 write_log 落盘（与后端日志同文件） */
@@ -212,6 +213,7 @@ export async function loadFloatConfig() {
   try {
     const cfg = await invoke<FloatWindowConfig>('get_float_config')
     store.floatEnabled = cfg.enabled
+    store.floatOrientation = cfg.orientation === 'vertical' ? 'vertical' : 'horizontal'
   } catch (err) {
     logFrontend('warn', `get_float_config 失败: ${err}`)
   }

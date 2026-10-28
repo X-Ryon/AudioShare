@@ -195,6 +195,7 @@ pub fn run() {
             float_window::get_float_config,
             float_window::set_float_enabled,
             float_window::snap_float,
+            float_window::rotate_float,
             float_window::save_float_position,
             float_window::show_main_window
         ])
