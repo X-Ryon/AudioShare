@@ -94,6 +94,9 @@ pub fn run() {
             }
             log::info!(target: "app", "AudioShare 启动");
 
+            // 登记主线程 ID（必须在 event loop 启动前）：悬浮窗创建时用于避开主线程死锁
+            crate::float_window::init_main_thread();
+
             // 初始化全局音频引擎状态
             commands::init_engine(app.handle().clone());
 

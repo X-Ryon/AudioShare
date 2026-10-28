@@ -6,6 +6,7 @@
  */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { PhysicalPosition, PhysicalSize } from '@tauri-apps/api/dpi'
 import { store, initStore, toggleMaster, toggleOutputMute, getAppIcon, logFrontend, setFloatEnabled } from '../stores/app'
@@ -13,9 +14,11 @@ import { store, initStore, toggleMaster, toggleOutputMute, getAppIcon, logFronte
 const appWindow = getCurrentWindow()
 const vertical = ref(false)      // 当前布局（吸附后切换）
 const settling = ref(false)      // 吸附执行中：抑制 onMoved 自激
+const movedOnce = ref(false)     // 已收到首个 onMoved（窗口显示/创建期的移动噪声需忽略）
 const icons = ref(new Map<number, string>()) // pid -> base64 data URL
 let moveTimer: number | undefined
 let unmounted = false
+let ignoreMoveUntil = 0   // 窗口重显后的噪声抑制截止时间戳（Windows hide→show 会连续发位置事件）
 
 const pids = computed(() => [...store.selected])
 // 垂直布局高度有限（232px），图标区最多显示 3 个，避免溢出裁切
@@ -55,8 +58,20 @@ function closeFloat() {
 onMounted(async () => {
   await initStore()
 
+  // 后端重显悬浮窗时广播：此后短时间内的 onMoved 是位置噪声，忽略以免误吸附
+  await listen('float_window_shown', () => {
+    ignoreMoveUntil = Date.now() + 600
+  })
+
   // 拖动（原生 drag-region）结束后 200ms 防抖吸附：后端纯函数计算，前端执行位置/尺寸切换
   await appWindow.onMoved(async () => {
+    if (Date.now() < ignoreMoveUntil) return
+    // 首次事件是窗口显示/创建期的移动噪声（此时并未拖动），
+    // 若不忽略会触发一次误吸附，把悬浮窗吸到屏幕边缘并切换布局
+    if (!movedOnce.value) {
+      movedOnce.value = true
+      return
+    }
     if (settling.value || unmounted) return
     clearTimeout(moveTimer)
     moveTimer = window.setTimeout(async () => {
