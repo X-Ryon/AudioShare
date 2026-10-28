@@ -3,8 +3,29 @@
 //! 坐标单位：全程物理像素（Tauri v2 window API 与 GetMonitorInfoW rcWork 均为物理像素）
 
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
+use std::time::Duration;
 use tauri::utils::config::Color;
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
+
+/// 主线程 ID（setup 阶段登记）
+///
+/// 【线程约束·关键】Tauri v2 运行期（event loop 已启动）在主线程调用
+/// `WebviewWindowBuilder::build()` 会自等待死锁：build 内部向主线程 event loop
+/// 投递创建事件并同步等待结果，而主线程在等待期间无法处理该事件。
+/// 症状：开启悬浮窗后只出现无内容的空壳窗口、后续命令全部排队、
+/// 日志不再输出、进程无法退出。setup 阶段建窗不受影响（event loop 尚未启动）。
+static MAIN_THREAD_ID: OnceLock<std::thread::ThreadId> = OnceLock::new();
+
+/// 登记主线程 ID（必须在 setup 中、event loop 启动前调用）
+pub fn init_main_thread() {
+    let _ = MAIN_THREAD_ID.set(std::thread::current().id());
+}
+
+/// 当前是否运行在主线程
+fn is_main_thread() -> bool {
+    MAIN_THREAD_ID.get() == Some(&std::thread::current().id())
+}
 
 /// 吸附阈值（物理像素，PRD FR-010/011：边缘 ≤20px 自动吸附）
 pub const SNAP_THRESHOLD: f64 = 20.0;
@@ -262,9 +283,17 @@ pub fn hide_float_window(app: &AppHandle) {
     let _ = app.emit("float_enabled_changed", false);
 }
 
-/// 显示悬浮窗：不存在则按配置创建，存在则 show + 聚焦（托盘/设置开关共用）。
+/// 显示悬浮窗：不存在则按配置创建，存在则 show（托盘/设置开关共用）。
 /// 显示即启用：落盘 enabled=true 并通知前端（主界面开关同步，托盘入口同样生效）
+///
+/// 【线程约束】若在主线程调用（托盘菜单回调即在主线程），窗口创建会死锁，
+/// 故派发到工作线程执行；调用方为异步 command 时本就在工作线程，直接执行。
 pub fn show_float_window(app: &AppHandle) {
+    if is_main_thread() {
+        let app2 = app.clone();
+        std::thread::spawn(move || show_float_window(&app2));
+        return;
+    }
     if app.get_webview_window("float").is_none() {
         let cfg = load_float_config(app);
         if let Err(e) = create_float_window(app, &cfg, true) {
@@ -274,7 +303,11 @@ pub fn show_float_window(app: &AppHandle) {
     }
     if let Some(w) = app.get_webview_window("float") {
         let _ = w.show();
-        let _ = w.set_focus();
+        // 不抢焦点：悬浮窗是常驻工具窗，set_focus 会把键盘焦点夺走，
+        // 鼠标恰好悬停在按钮上时会误触（曾导致共享被意外开启、闭麦被反复翻转）
+        // 重显后补回置顶：Windows 上 hide→show 可能丢失 WS_EX_TOPMOST 标志，
+        // 否则会被全屏应用盖住（用户看到悬浮窗消失）
+        let _ = w.set_always_on_top(true);
     }
     let mut cfg = load_float_config(app);
     if !cfg.enabled {
@@ -282,6 +315,10 @@ pub fn show_float_window(app: &AppHandle) {
         save_float_config(app, &cfg);
     }
     let _ = app.emit("float_enabled_changed", true);
+    // 通知前端：窗口刚重显，Windows 会连续发几次位置噪声事件，
+    // 前端需在短窗口内忽略 onMoved，否则会触发一次误吸附（位置漂移/布局跳变）
+    let _ = app.emit("float_window_shown", ());
+    log::info!(target: "float", "悬浮窗已显示");
 }
 
 // ---------- 命令（前端 invoke） ----------
@@ -294,8 +331,14 @@ pub fn get_float_config(app: AppHandle) -> FloatWindowConfig {
 
 /// 开关悬浮窗：on=true 显示悬浮窗并自动隐藏主界面（第3期验收反馈），
 /// on=false 隐藏悬浮窗；enabled 落盘与前端事件由 show/hide_float_window 统一处理
+///
+/// 【线程约束·关键】必须为 async command：Tauri v2 的同步 command 在主线程执行，
+/// 而在主线程调用 `WebviewWindowBuilder::build()` 会自等待死锁（见 MAIN_THREAD_ID 注释）。
+/// async command 在 async runtime 线程执行，build() 投递到主线程 event loop 后
+/// 由 event loop 正常处理创建，不会卡死。
 #[tauri::command]
-pub fn set_float_enabled(app: AppHandle, on: bool) -> Result<(), String> {
+pub async fn set_float_enabled(app: AppHandle, on: bool) -> Result<(), String> {
+    log::info!(target: "float", "set_float_enabled on={on} 线程={:?}", std::thread::current().id());
     if on {
         show_float_window(&app);
         if let Some(m) = app.get_webview_window("main") {
@@ -303,6 +346,21 @@ pub fn set_float_enabled(app: AppHandle, on: bool) -> Result<(), String> {
         }
     } else {
         hide_float_window(&app);
+        // 关闭悬浮窗 → 主窗口回归：开启悬浮窗时主窗口被隐藏，
+        // 若关闭后不恢复，用户将既无悬浮窗也无主界面（只能从托盘唤回）
+        if let Some(m) = app.get_webview_window("main") {
+            let _ = m.show();
+            let _ = m.unminimize();
+            let _ = m.set_focus();
+            // Windows 从后台恢复窗口时 SetForegroundWindow 常被系统拦截，
+            // 短暂置顶再取消，确保用户真的能看到主界面
+            let _ = m.set_always_on_top(true);
+            let m2 = m.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(1200));
+                let _ = m2.set_always_on_top(false);
+            });
+        }
     }
     Ok(())
 }
