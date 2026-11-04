@@ -1,12 +1,13 @@
 //! 悬浮窗窗口管理（第3期）：第二窗口（label="float"）、位置配置持久化、边缘吸附纯函数
 //! 追溯：TC-045~048/050/055~057（PRD FR-001/009/010/011/013/015）
-//! 坐标单位：全程物理像素（Tauri v2 window API 与 GetMonitorInfoW rcWork 均为物理像素）
+//! 坐标单位：全程【逻辑像素】（Tauri v2 窗口 API 用 LogicalSize/LogicalPosition，
+//! WebView 视口即逻辑尺寸；GetMonitorInfoW rcWork 为物理像素，使用时 ÷ 所在屏 scale factor）
 
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 use std::time::Duration;
 use tauri::utils::config::Color;
-use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, LogicalPosition, Manager, WebviewUrl, WebviewWindowBuilder};
 
 /// 主线程 ID（setup 阶段登记）
 ///
@@ -285,10 +286,15 @@ pub fn save_float_config(app: &AppHandle, cfg: &FloatWindowConfig) {
 
 // ---------- 工作区查询与窗口生命周期（窗口 API 不做单测，真机验收覆盖） ----------
 
-/// 悬浮窗所在显示器工作区（GetMonitorInfoW rcWork，物理像素，避开任务栏）
+/// 悬浮窗所在显示器工作区（GetMonitorInfoW rcWork，避开任务栏；【逻辑像素】）
+/// 【FR-024】rcWork 为物理像素，÷ 所在屏 scale factor 转逻辑：高 DPI 屏（如 2K@125%）下
+/// 窗口 API 用逻辑尺寸时 WebView 视口 = 完整逻辑尺寸，几何若用物理口径会导致吸附错位。
 pub fn work_area_of_float_window(app: &AppHandle) -> Option<Rect> {
     use windows::Win32::Foundation::HWND;
-    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+    use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
     unsafe {
         // 悬浮窗存在 → 其所在显示器；否则主窗口所在显示器
         let hwnd: Option<HWND> = app
@@ -299,20 +305,27 @@ pub fn work_area_of_float_window(app: &AppHandle) -> Option<Rect> {
         let hmon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
         let mut info = MONITORINFO::default();
         info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-        if GetMonitorInfoW(hmon, &mut info).as_bool() {
-            Some(Rect {
-                x: info.rcWork.left as f64,
-                y: info.rcWork.top as f64,
-                w: (info.rcWork.right - info.rcWork.left) as f64,
-                h: (info.rcWork.bottom - info.rcWork.top) as f64,
-            })
-        } else {
-            None
+        if !GetMonitorInfoW(hmon, &mut info).as_bool() {
+            return None;
         }
+        // 物理 → 逻辑：除以窗口所在屏的 DPI scale factor（查询失败按 1.0 兜底）
+        let mut dpi_x = 0u32;
+        let mut dpi_y = 0u32;
+        let scale = if GetDpiForMonitor(hmon, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y).is_ok() && dpi_x > 0 {
+            dpi_x as f64 / 96.0
+        } else {
+            1.0
+        };
+        Some(Rect {
+            x: info.rcWork.left as f64 / scale,
+            y: info.rcWork.top as f64 / scale,
+            w: (info.rcWork.right - info.rcWork.left) as f64 / scale,
+            h: (info.rcWork.bottom - info.rcWork.top) as f64 / scale,
+        })
     }
 }
 
-/// 创建悬浮窗窗口（label="float"，无边框置顶透明、不入任务栏、不可缩放；物理像素）
+/// 创建悬浮窗窗口（label="float"，无边框置顶透明、不入任务栏、不可缩放；逻辑像素）
 /// 已存在时无操作；【FR-021】位置一律取默认位置（水平居中 + 顶端吸附），不使用落盘坐标
 pub fn create_float_window(app: &AppHandle, cfg: &FloatWindowConfig, visible: bool) -> tauri::Result<()> {
     if app.get_webview_window("float").is_some() {
@@ -321,11 +334,8 @@ pub fn create_float_window(app: &AppHandle, cfg: &FloatWindowConfig, visible: bo
     let vertical = parse_orientation(&cfg.orientation) == Orientation::Vertical;
     // 初始尺寸取【基础尺寸】（图标区为空）：前端挂载后按实际共享应用数调整为 target_size
     let (w, h) = if vertical { BASE_SIZE_VERTICAL } else { BASE_SIZE_HORIZONTAL };
-    // builder 的 inner_size/position 为逻辑像素签名，按主窗口 scale 换算（目标尺寸为物理像素）
-    let scale = app
-        .get_webview_window("main")
-        .and_then(|w| w.scale_factor().ok())
-        .unwrap_or(1.0);
+    // 【FR-024】尺寸/位置直接按逻辑像素传给 builder：Tauri 自动按所在屏 DPI 换算物理尺寸，
+    // WebView 视口即完整逻辑尺寸（高 DPI 屏下不再溢出/裁剪）
     // 【FR-021】每次开启恢复到默认位置（水平居中 + 顶端吸附），
     // 不再读取 cfg.x/cfg.y，避免异常位置（如拖出屏幕）后无法找回
     let (px, py) = match work_area_of_float_window(app) {
@@ -341,21 +351,24 @@ pub fn create_float_window(app: &AppHandle, cfg: &FloatWindowConfig, visible: bo
         .background_color(Color(0, 0, 0, 0))
         .skip_taskbar(true)
         .resizable(false)
-        .inner_size(w / scale, h / scale)
-        .position(px / scale, py / scale)
+        .inner_size(w, h)
+        .position(px, py)
         .visible(visible);
     builder.build()?;
     // 【FR-021·Windows 实测】builder 的 position() 在 Windows 上不生效：
     // 窗口会被创建在鼠标光标处（如 (1872,195)），而非指定坐标。
     // 故建窗后统一显式 set_position 到默认位置，保证"开启即在屏幕水平居中 + 顶端"。
     if let Some(win) = app.get_webview_window("float") {
-        // 用【外层】宽居中（含隐形边框，内外层同时居中无视觉偏移）
-        let outer_w = win.outer_size().map(|s| s.width as f64).unwrap_or(w);
+        // 用【外层】宽居中（含隐形边框，内外层同时居中无视觉偏移）；逻辑像素口径
+        let outer_w = win
+            .outer_size()
+            .map(|s| s.width as f64 / win.scale_factor().unwrap_or(1.0))
+            .unwrap_or(w);
         let (fx, fy) = match work_area_of_float_window(app) {
             Some(work) => default_float_position(work, outer_w),
             None => (px, py),
         };
-        let _ = win.set_position(PhysicalPosition::new(fx as i32, fy as i32));
+        let _ = win.set_position(LogicalPosition::new(fx, fy));
         log::info!(target: "float", "悬浮窗已定位到默认位置 ({fx},{fy}) 外层宽={outer_w}");
     }
     log::info!(target: "float", "悬浮窗已创建 visible={visible} 位置=({px},{py})");
@@ -420,9 +433,13 @@ pub fn show_float_window(app: &AppHandle) {
         // 【FR-021】每次开启恢复到默认位置（水平居中 + 顶端吸附）：
         // 悬浮窗被拖出屏幕/异常卡位后，"关掉再打开"即可找回，不会丢失入口
         if let Some(work) = work_area_of_float_window(&app) {
-            let cur_w = w.outer_size().map(|s| s.width as f64).unwrap_or(BASE_SIZE_HORIZONTAL.0);
+            // 外层宽为物理像素 → ÷ scale 转逻辑（【FR-024】全链路逻辑口径）
+            let cur_w = w
+                .outer_size()
+                .map(|s| s.width as f64 / w.scale_factor().unwrap_or(1.0))
+                .unwrap_or(BASE_SIZE_HORIZONTAL.0);
             let (px, py) = default_float_position(work, cur_w);
-            let _ = w.set_position(PhysicalPosition::new(px as i32, py as i32));
+            let _ = w.set_position(LogicalPosition::new(px, py));
             log::info!(target: "float", "悬浮窗已恢复到默认位置 ({px},{py})");
         }
     }
@@ -493,7 +510,7 @@ pub fn snap_float(app: AppHandle, x: f64, y: f64, w: f64, h: f64, icon_count: us
 }
 
 /// 手动旋转布局（FR-016）：水平 ↔ 垂直
-/// 返回目标坐标与尺寸（物理像素），前端据此做 6 步插值过渡并落盘
+/// 返回目标坐标与尺寸（逻辑像素），前端据此做 6 步插值过渡并落盘
 #[tauri::command]
 pub fn rotate_float(app: AppHandle, x: f64, y: f64, w: f64, h: f64, icon_count: usize) -> Result<SnapResult, String> {
     let work = work_area_of_float_window(&app).ok_or("无法获取显示器工作区")?;
@@ -502,7 +519,7 @@ pub fn rotate_float(app: AppHandle, x: f64, y: f64, w: f64, h: f64, icon_count: 
     Ok(rotate_to(rect, current, work, icon_count))
 }
 
-/// 目标布局方向 + 应用图标数 → 窗口尺寸（物理像素）
+/// 目标布局方向 + 应用图标数 → 窗口尺寸（逻辑像素）
 /// 前端在共享应用数变化时调用，按结果调整窗口尺寸（尺寸口径单一真源在后端）
 #[tauri::command]
 pub fn float_target_size(orientation: String, icon_count: usize) -> (f64, f64) {
@@ -523,10 +540,13 @@ pub fn fit_float_position(app: AppHandle, x: f64, y: f64, w: f64, h: f64) -> Res
 /// 前端挂载时也可能早于后端建窗定位，故由本命令提供唯一真源做一次对齐。
 #[tauri::command]
 pub fn float_default_position(app: AppHandle) -> (f64, f64) {
+    // 外层宽为物理像素 → ÷ scale 转逻辑（【FR-024】全链路逻辑口径）
     let outer_w = app
         .get_webview_window("float")
-        .and_then(|w| w.outer_size().ok())
-        .map(|s| s.width as f64)
+        .and_then(|w| {
+            let scale = w.scale_factor().ok().unwrap_or(1.0);
+            w.outer_size().ok().map(|s| s.width as f64 / scale)
+        })
         .unwrap_or(BASE_SIZE_HORIZONTAL.0);
     match work_area_of_float_window(&app) {
         Some(work) => default_float_position(work, outer_w),

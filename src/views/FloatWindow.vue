@@ -17,18 +17,18 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
-import { PhysicalPosition, PhysicalSize } from '@tauri-apps/api/dpi'
+import { LogicalPosition, LogicalSize } from '@tauri-apps/api/dpi'
 import { store, initStore, toggleMaster, toggleOutputMute, getAppIcon, logFrontend, setFloatEnabled } from '../stores/app'
 import FloatIcon from '../components/FloatIcon.vue'
 
-/** 后端返回的几何结果（物理像素） */
+/** 后端返回的几何结果（逻辑像素，FR-024 全链路逻辑口径） */
 interface FloatGeometry {
   x: number
   y: number
   orientation: 'horizontal' | 'vertical'
-  /** 目标宽（物理像素）：前端 setSize 直接使用，避免前后端两处硬编码尺寸漂移 */
+  /** 目标宽（逻辑像素）：前端 setSize 直接使用，避免前后端两处硬编码尺寸漂移 */
   w: number
-  /** 目标高（物理像素） */
+  /** 目标高（逻辑像素） */
   h: number
 }
 
@@ -47,10 +47,26 @@ const icons = ref(new Map<number, string>()) // pid -> base64 data URL
 let moveTimer: number | undefined
 let unmounted = false
 let ignoreMoveUntil = 0   // 窗口重显/旋转后的噪声抑制截止时间戳
-/** 上一次已知的窗口位置（外层，物理像素）：用于识别"位置未变的移动事件"（系统噪声） */
+/** 上一次已知的窗口位置（外层，逻辑像素）：用于识别"位置未变的移动事件"（系统噪声） */
 let lastKnownPos: { x: number; y: number } | null = null
 /** 是否仍锚定在默认位置（FR-021）：开启后为 true；用户主动拖动/旋转后为 false */
 let pinnedToDefault = true
+
+/**
+ * 窗口外层位置/内层尺寸 → 逻辑像素（FR-024）。
+ * Tauri 的 outerPosition/innerSize 返回物理像素，必须 ÷ 当前所在屏 scaleFactor：
+ * 跨屏拖动后所在屏 DPI 可能变化，故每次几何操作前都重新读取。
+ */
+async function logicalPos(): Promise<{ x: number; y: number }> {
+  const [p, s] = await Promise.all([appWindow.outerPosition(), appWindow.scaleFactor()])
+  const lp = p.toLogical(s)
+  return { x: lp.x, y: lp.y }
+}
+async function logicalSize(): Promise<{ w: number; h: number }> {
+  const [sz, s] = await Promise.all([appWindow.innerSize(), appWindow.scaleFactor()])
+  const ls = sz.toLogical(s)
+  return { w: ls.width, h: ls.height }
+}
 
 const pids = computed(() => [...store.selected])
 // 图标区固定最多显示 3 个应用（水平/垂直一致，保证窗口尺寸上限可控）
@@ -90,15 +106,16 @@ function closeFloat() {
 /**
  * 位置/尺寸 6 步插值（约 90ms）：吸附切换与手动旋转共用，消除尺寸跳变
  * 目标位置已含后端以 ⠿ 手柄为锚点的补偿，避免切换时僵硬和窗口错位
+ * （逻辑像素口径：setSize/setPosition 用 LogicalSize/LogicalPosition，Tauri 按屏 DPI 换算物理）
  */
 async function animateTo(from: FloatGeometry, to: FloatGeometry) {
   for (let i = 1; i <= TRANSITION_STEPS; i++) {
     const t = i / TRANSITION_STEPS
-    await appWindow.setSize(new PhysicalSize(
+    await appWindow.setSize(new LogicalSize(
       Math.round(from.w + (to.w - from.w) * t),
       Math.round(from.h + (to.h - from.h) * t),
     ))
-    await appWindow.setPosition(new PhysicalPosition(
+    await appWindow.setPosition(new LogicalPosition(
       Math.round(from.x + (to.x - from.x) * t),
       Math.round(from.y + (to.y - from.y) * t),
     ))
@@ -118,12 +135,12 @@ async function alignToDefault() {
   if (!pinnedToDefault || unmounted) return
   try {
     const [dx, dy] = await invoke<[number, number]>('float_default_position')
-    const pos = await appWindow.outerPosition()
+    const pos = await logicalPos()
     if (Math.abs(pos.x - dx) < 1 && Math.abs(pos.y - dy) < 1) {
       lastKnownPos = { x: pos.x, y: pos.y }
       return
     }
-    await appWindow.setPosition(new PhysicalPosition(Math.round(dx), Math.round(dy)))
+    await appWindow.setPosition(new LogicalPosition(Math.round(dx), Math.round(dy)))
     lastKnownPos = { x: Math.round(dx), y: Math.round(dy) }
     ignoreMoveUntil = Date.now() + 600
     logFrontend('info', `悬浮窗对齐默认位置 (${Math.round(dx)},${Math.round(dy)})`)
@@ -150,18 +167,18 @@ async function resizeToContent() {
     const n = visiblePids.value.length
     const orient: 'horizontal' | 'vertical' = vertical.value ? 'vertical' : 'horizontal'
     const [tw, th] = await invoke<[number, number]>('float_target_size', { orientation: orient, iconCount: n })
-    const size = await appWindow.innerSize()
-    if (Math.round(size.width) === Math.round(tw) && Math.round(size.height) === Math.round(th)) return
-    const pos = await appWindow.outerPosition()
+    const size = await logicalSize()
+    if (Math.round(size.w) === Math.round(tw) && Math.round(size.h) === Math.round(th)) return
+    const pos = await logicalPos()
     settling.value = true
     await animateTo(
-      { x: pos.x, y: pos.y, w: size.width, h: size.height, orientation: orient },
+      { x: pos.x, y: pos.y, w: size.w, h: size.h, orientation: orient },
       { x: pos.x, y: pos.y, w: tw, h: th, orientation: orient },
     )
     // 变宽/变高后可能超出工作区 → 拉回
     const [cx, cy] = await invoke<[number, number]>('fit_float_position', { x: pos.x, y: pos.y, w: tw, h: th })
     if (Math.round(cx) !== Math.round(pos.x) || Math.round(cy) !== Math.round(pos.y)) {
-      await appWindow.setPosition(new PhysicalPosition(Math.round(cx), Math.round(cy)))
+      await appWindow.setPosition(new LogicalPosition(Math.round(cx), Math.round(cy)))
     }
     settling.value = false
     ignoreMoveUntil = Date.now() + 600
@@ -184,17 +201,18 @@ async function rotateLayout(e?: MouseEvent) {
   window.setTimeout(() => { spinning.value = false }, 280)
   logFrontend('info', `旋转点击 screen=(${e?.screenX ?? -1},${e?.screenY ?? -1})`)
   try {
-    const pos = await appWindow.outerPosition()
-    // 尺寸用【内层】尺寸（setSize 设置的就是内层尺寸）；位置用【外层】位置（setPosition 设置的就是外层位置）
-    const size = await appWindow.innerSize()
+    // 位置用【外层】位置（setPosition 设置的就是外层位置）；尺寸用【内层】尺寸（setSize 设置的就是内层尺寸）
+    // 均转逻辑像素（FR-024），后端几何口径一致
+    const pos = await logicalPos()
+    const size = await logicalSize()
     const r = await invoke<FloatGeometry>('rotate_float', {
-      x: pos.x, y: pos.y, w: size.width, h: size.height,
+      x: pos.x, y: pos.y, w: size.w, h: size.h,
       iconCount: visiblePids.value.length,
     })
     settling.value = true
     vertical.value = r.orientation === 'vertical'
     await animateTo(
-      { x: pos.x, y: pos.y, w: size.width, h: size.height, orientation: r.orientation },
+      { x: pos.x, y: pos.y, w: size.w, h: size.h, orientation: r.orientation },
       { x: r.x, y: r.y, w: r.w, h: r.h, orientation: r.orientation },
     )
     settling.value = false
@@ -223,7 +241,7 @@ onMounted(async () => {
   ignoreMoveUntil = Date.now() + 1500
   // 记录初始位置基准（用于识别"位置未变的移动事件"）
   try {
-    const p0 = await appWindow.outerPosition()
+    const p0 = await logicalPos()
     lastKnownPos = { x: p0.x, y: p0.y }
   } catch (e) {
     logFrontend('warn', `读取初始位置失败: ${e}`)
@@ -252,7 +270,7 @@ onMounted(async () => {
         // 若只在回调入口检查一次，延迟 200ms 后仍会执行一次误吸附
         //（默认位置 y=0 属"贴顶"，误吸附会把用户的垂直布局改成水平）
         if (Date.now() < ignoreMoveUntil) return
-        const pos = await appWindow.outerPosition()
+        const pos = await logicalPos()
         // 【噪声过滤】位置未发生实质位移的移动事件 = 窗口创建/显示/置顶引发的系统消息，并非用户拖动。
         // 若不拦截，刚定位到默认位置的窗口会被误吸附到边缘（甚至把垂直布局改回水平）
         if (lastKnownPos && Math.abs(pos.x - lastKnownPos.x) < 2 && Math.abs(pos.y - lastKnownPos.y) < 2) {
@@ -262,9 +280,9 @@ onMounted(async () => {
         lastKnownPos = { x: pos.x, y: pos.y }
         // 用户主动拖动 → 不再锚定默认位置
         pinnedToDefault = false
-        const size = await appWindow.innerSize()
+        const size = await logicalSize()
         const r = await invoke<FloatGeometry>('snap_float', {
-          x: pos.x, y: pos.y, w: size.width, h: size.height,
+          x: pos.x, y: pos.y, w: size.w, h: size.h,
           iconCount: visiblePids.value.length,
         })
         logFrontend('info', `吸附结果 orientation=${r.orientation} pos=(${r.x},${r.y}) size=${r.w}x${r.h}`)
@@ -273,7 +291,7 @@ onMounted(async () => {
         vertical.value = isVert
         // 目标尺寸由后端随 SnapResult 返回（w/h），前端不再硬编码 [232,44]/[44,232]
         await animateTo(
-          { x: pos.x, y: pos.y, w: size.width, h: size.height, orientation: r.orientation },
+          { x: pos.x, y: pos.y, w: size.w, h: size.h, orientation: r.orientation },
           { x: r.x, y: r.y, w: r.w, h: r.h, orientation: r.orientation },
         )
         settling.value = false
