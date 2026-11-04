@@ -106,6 +106,8 @@ pub struct SnapResult {
     pub w: f64,
     /// 目标高（物理像素）
     pub h: f64,
+    /// 本次评估是否贴边吸附（四边任一在阈值内）：前端据此在贴边 2s 后降低透明度
+    pub snapped: bool,
 }
 
 /// 应用图标区跨度：n 个图标 → n*20 + (n-1)*4（n=0 → 0）
@@ -189,21 +191,21 @@ pub fn snap_to_edge(rect: Rect, work: Rect, monitor: Rect, threshold: f64, curre
     let min = d_t.min(d_b).min(d_l).min(d_r);
     if min > threshold {
         let (w, h) = target_size(current, icon_count);
-        return SnapResult { x: rect.x, y: rect.y, orientation: current, w, h };
+        return SnapResult { x: rect.x, y: rect.y, orientation: current, w, h, snapped: false };
     }
     // 分支顺序即并列优先级：顶 > 底 > 左 > 右；贴底/贴右必须用目标布局尺寸
     // （如垂直窗贴底 → 水平窗矮，若用 rect.h 会悬空）
     let (hw, hh) = target_size(Orientation::Horizontal, icon_count);
     let (vw, vh) = target_size(Orientation::Vertical, icon_count);
     if d_t == min {
-        SnapResult { x: rect.x, y: work.y, orientation: Orientation::Horizontal, w: hw, h: hh }
+        SnapResult { x: rect.x, y: work.y, orientation: Orientation::Horizontal, w: hw, h: hh, snapped: true }
     } else if d_b == min {
         // 贴底：目标 y = 物理屏幕底 - 目标高（monitor 底，非 work 底）
-        SnapResult { x: rect.x, y: monitor.y + monitor.h - hh, orientation: Orientation::Horizontal, w: hw, h: hh }
+        SnapResult { x: rect.x, y: monitor.y + monitor.h - hh, orientation: Orientation::Horizontal, w: hw, h: hh, snapped: true }
     } else if d_l == min {
-        SnapResult { x: work.x, y: rect.y, orientation: Orientation::Vertical, w: vw, h: vh }
+        SnapResult { x: work.x, y: rect.y, orientation: Orientation::Vertical, w: vw, h: vh, snapped: true }
     } else {
-        SnapResult { x: work.x + work.w - vw, y: rect.y, orientation: Orientation::Vertical, w: vw, h: vh }
+        SnapResult { x: work.x + work.w - vw, y: rect.y, orientation: Orientation::Vertical, w: vw, h: vh, snapped: true }
     }
 }
 
@@ -261,7 +263,7 @@ pub fn clamp_to_work_area(x: f64, y: f64, w: f64, h: f64, work: Rect, monitor: R
 pub fn anchor_adjust(rect: Rect, mut r: SnapResult, current: Orientation, work: Rect, icon_count: usize) -> SnapResult {
     if r.orientation == current {
         let (w, h) = target_size(r.orientation, icon_count);
-        return SnapResult { x: r.x, y: r.y, orientation: r.orientation, w, h };
+        return SnapResult { x: r.x, y: r.y, orientation: r.orientation, w, h, snapped: r.snapped };
     }
     if r.orientation == Orientation::Vertical {
         // 水平手柄中心 y = rect.y + rect.h/2（垂直居中）；垂直布局手柄中心 = r.y + SLIDER_AXIS_OFFSET
@@ -275,7 +277,7 @@ pub fn anchor_adjust(rect: Rect, mut r: SnapResult, current: Orientation, work: 
         r.x = (rect.x + rect.w / 2.0 - SLIDER_AXIS_OFFSET).clamp(work.x, work.x + max_x);
     }
     let (w, h) = target_size(r.orientation, icon_count);
-    SnapResult { x: r.x, y: r.y, orientation: r.orientation, w, h }
+    SnapResult { x: r.x, y: r.y, orientation: r.orientation, w, h, snapped: r.snapped }
 }
 
 /// 手动旋转布局（FR-016）：水平 ↔ 垂直
@@ -285,12 +287,12 @@ pub fn rotate_to(rect: Rect, current: Orientation, work: Rect, monitor: Rect, ic
         Orientation::Horizontal => Orientation::Vertical,
         Orientation::Vertical => Orientation::Horizontal,
     };
-    let raw = SnapResult { x: rect.x, y: rect.y, orientation: target, w: 0.0, h: 0.0 };
+    let raw = SnapResult { x: rect.x, y: rect.y, orientation: target, w: 0.0, h: 0.0, snapped: false };
     let adj = anchor_adjust(rect, raw, current, work, icon_count);
     // clamp 用无边框口径（下限 work），贴边窗口的边框补偿由命令层在 clamp 后恢复
     // （否则贴左的负坐标会被 clamp 拉回，旋转后空隙重现）
     let (cx, cy) = clamp_to_work_area(adj.x, adj.y, adj.w, adj.h, work, monitor);
-    SnapResult { x: cx, y: cy, orientation: adj.orientation, w: adj.w, h: adj.h }
+    SnapResult { x: cx, y: cy, orientation: adj.orientation, w: adj.w, h: adj.h, snapped: false }
 }
 
 // ---------- 配置持久化（TDD-T3） ----------
@@ -412,6 +414,8 @@ pub fn create_float_window(app: &AppHandle, cfg: &FloatWindowConfig, visible: bo
     let builder = WebviewWindowBuilder::new(app, "float", WebviewUrl::App("index.html".into()))
         .title("AudioShare 悬浮窗")
         .decorations(false)
+        // 禁用 DWM 窗口阴影：无边框窗口默认带阴影，在角落边缘形成一圈浅色描边（用户反馈移除）
+        .shadow(false)
         .always_on_top(true)
         .transparent(true)
         // Windows 上 WebView2 透明窗口默认白色合成底，显式透明背景色避免白底矩形（TC-046）
@@ -792,6 +796,29 @@ mod tests {
         assert_eq!(clamp_to_work_area(100.0, 100.0, 3000.0, 2000.0, work, monitor), (0.0, 0.0));
     }
 
+    /// 吸附标志：四边任一在阈值内 → snapped=true；超阈值原样 → snapped=false；
+    /// anchor_adjust 保留标志（同方向/换向路径）；手动旋转不带吸附标志（前端据此降透明度）
+    #[test]
+    fn snap_result_carries_snapped_flag() {
+        let work = work();
+        let monitor = monitor();
+        // 距左 5px（阈值内）→ 垂直布局 + 吸附标志
+        let r = snap_to_edge(Rect { x: 5.0, y: 400.0, w: 299.0, h: 44.0 }, work, monitor, SNAP_THRESHOLD, Orientation::Horizontal, ICONS);
+        assert!(r.snapped);
+        assert_eq!(r.orientation, Orientation::Vertical);
+        // 距四边均超阈值 → 原样返回 + 不吸附
+        let r = snap_to_edge(Rect { x: 600.0, y: 400.0, w: 299.0, h: 44.0 }, work, monitor, SNAP_THRESHOLD, Orientation::Horizontal, ICONS);
+        assert!(!r.snapped);
+        // anchor_adjust 保留吸附标志（方向切换路径）
+        let rect = Rect { x: 5.0, y: 400.0, w: 299.0, h: 44.0 };
+        let r = snap_to_edge(rect, work, monitor, SNAP_THRESHOLD, Orientation::Horizontal, ICONS);
+        let r2 = anchor_adjust(rect, r, Orientation::Horizontal, work, ICONS);
+        assert!(r2.snapped);
+        // 手动旋转不带吸附标志（非贴边语义）
+        let r3 = rotate_to(rect, Orientation::Horizontal, work, monitor, ICONS);
+        assert!(!r3.snapped);
+    }
+
     /// 贴边隐形边框补偿：贴哪边就把内容在外层内的偏移向外减（左/右减 bl、顶/底减 bt），
     /// 使内层（可见内容）边缘恰好贴平屏幕、内容完整可见；非贴边不动
     #[test]
@@ -801,25 +828,25 @@ mod tests {
         // 主屏 96dpi 实测边框：左/右/底 8px、顶 1px（逻辑像素）
         let border = (8.0, 1.0, 8.0, 8.0);
         // 贴左（垂直 48 宽）→ x 向外减 8，内容左 = 0
-        let left = SnapResult { x: 0.0, y: 400.0, orientation: Orientation::Vertical, w: 48.0, h: 287.0 };
+        let left = SnapResult { x: 0.0, y: 400.0, orientation: Orientation::Vertical, w: 48.0, h: 287.0, snapped: true };
         let r = border_compensate(left, work, monitor, border);
         assert_eq!((r.x, r.y), (-8.0, 400.0));
         // 贴右 → x 向外减 8，内容右 = 1920 完整可见（不得超出被屏幕切掉）
-        let right = SnapResult { x: work.w - 48.0, y: 400.0, orientation: Orientation::Vertical, w: 48.0, h: 287.0 };
+        let right = SnapResult { x: work.w - 48.0, y: 400.0, orientation: Orientation::Vertical, w: 48.0, h: 287.0, snapped: true };
         let r = border_compensate(right, work, monitor, border);
         assert_eq!((r.x, r.y), (work.w - 48.0 - 8.0, 400.0));
         assert_eq!(r.x + 8.0 + r.w, 1920.0); // 内容右缘恰好贴平屏幕右缘
         // 贴顶 → y 向外减 1
-        let top = SnapResult { x: 600.0, y: 0.0, orientation: Orientation::Horizontal, w: 299.0, h: 44.0 };
+        let top = SnapResult { x: 600.0, y: 0.0, orientation: Orientation::Horizontal, w: 299.0, h: 44.0, snapped: true };
         let r = border_compensate(top, work, monitor, border);
         assert_eq!((r.x, r.y), (600.0, -1.0));
         // 贴底（屏幕物理底）→ y 向外减 1，内容底 = 1080 贴平物理底
-        let bottom = SnapResult { x: 600.0, y: monitor.h - 44.0, orientation: Orientation::Horizontal, w: 299.0, h: 44.0 };
+        let bottom = SnapResult { x: 600.0, y: monitor.h - 44.0, orientation: Orientation::Horizontal, w: 299.0, h: 44.0, snapped: true };
         let r = border_compensate(bottom, work, monitor, border);
         assert_eq!((r.x, r.y), (600.0, monitor.h - 44.0 - 1.0));
         assert_eq!(r.y + 1.0 + r.h, 1080.0); // 内容底缘恰好贴平物理屏底
         // 非贴边 → 原样返回
-        let free = SnapResult { x: 600.0, y: 400.0, orientation: Orientation::Horizontal, w: 299.0, h: 44.0 };
+        let free = SnapResult { x: 600.0, y: 400.0, orientation: Orientation::Horizontal, w: 299.0, h: 44.0, snapped: false };
         let r = border_compensate(free, work, monitor, border);
         assert_eq!((r.x, r.y), (600.0, 400.0));
     }

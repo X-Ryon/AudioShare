@@ -34,7 +34,12 @@ interface FloatGeometry {
   w: number
   /** 目标高（逻辑像素） */
   h: number
+  /** 本次评估是否贴边吸附：贴边 2s 后窗口透明度降到 35%（悬停恢复），脱离边缘恢复 */
+  snapped: boolean
 }
+
+/** 基础几何（不含吸附标志）：animateTo/applyOrientation 内部流转用，吸附标志仅 snap_float 返回 */
+type FloatGeometryBase = Omit<FloatGeometry, 'snapped'>
 
 /** 过渡动画步数（6 步 × 15ms ≈ 90ms） */
 const TRANSITION_STEPS = 6
@@ -48,7 +53,9 @@ const movedOnce = ref(false)     // 已收到首个 onMoved（窗口显示/创�
 const spinning = ref(false)      // 旋转按钮自转动效
 const busy = ref(false)          // 旋转/吸附互斥，避免并发改窗口尺寸
 const icons = ref(new Map<number, string>()) // pid -> base64 data URL
+const dimmed = ref(false)        // 贴边吸附 2s 后降透明度（悬停仍恢复不透明）
 let moveTimer: number | undefined
+let dimTimer: number | undefined
 let unmounted = false
 let ignoreMoveUntil = 0   // 窗口重显/旋转后的噪声抑制截止时间戳
 /** 上一次已知的窗口位置（外层，逻辑像素）：用于识别"位置未变的移动事件"（系统噪声） */
@@ -154,7 +161,9 @@ async function evaluateSnap(): Promise<boolean> {
       x: pos.x, y: pos.y, w: size.w, h: size.h,
       iconCount: visiblePids.value.length,
     })
-    logFrontend('info', `吸附结果 orientation=${r.orientation} pos=(${r.x},${r.y}) size=${r.w}x${r.h}`)
+    // 贴边吸附 → 2s 后降透明度；脱离边缘 → 立即恢复（悬停时 CSS 仍恢复不透明）
+    scheduleDim(r.snapped)
+    logFrontend('info', `吸附结果 orientation=${r.orientation} pos=(${r.x},${r.y}) size=${r.w}x${r.h} snapped=${r.snapped}`)
     const isVert = r.orientation === 'vertical'
     // 结果与现状几乎一致（方向/位置/尺寸）→ 跳过动画：补评估由动画自身的位置噪声触发时，
     // 吸附结果就是当前状态，重复动画无意义且会闪烁
@@ -187,6 +196,22 @@ async function evaluateSnap(): Promise<boolean> {
 }
 
 /**
+ * 贴边吸附透明度调度：snapped=true → 2s 后透明度降到 35%（不再遮挡桌面内容）；
+ * snapped=false（拖离边缘）→ 取消定时并立即恢复默认透明度。
+ * 悬停时由 CSS .float.dimmed:hover 恢复不透明，移出后仍回 35%。
+ */
+function scheduleDim(snapped: boolean) {
+  clearTimeout(dimTimer)
+  if (!snapped) {
+    dimmed.value = false
+    return
+  }
+  dimTimer = window.setTimeout(() => {
+    dimmed.value = true
+  }, 2000)
+}
+
+/**
  * 动画/抑制期间被吞掉的移动事件补偿：延迟 150ms 重新评估吸附（等动画残余噪声平息）。
  * 修复：拖到屏幕边缘释放时若恰逢吸附动画/抑制窗口，移动事件被吞 →
  * 窗口停在边缘但布局/尺寸未切换（用户反馈：左侧吸附有概率尺寸不变）。
@@ -204,7 +229,7 @@ function maybeSnapAfterSettle() {
  * 目标位置已含后端以 ⠿ 手柄为锚点的补偿，避免切换时僵硬和窗口错位
  * （逻辑像素口径：setSize/setPosition 用 LogicalSize/LogicalPosition，Tauri 按屏 DPI 换算物理）
  */
-async function animateTo(from: FloatGeometry, to: FloatGeometry) {
+async function animateTo(from: FloatGeometryBase, to: FloatGeometryBase) {
   for (let i = 1; i <= TRANSITION_STEPS; i++) {
     const t = i / TRANSITION_STEPS
     await appWindow.setSize(new LogicalSize(
@@ -226,7 +251,7 @@ async function animateTo(from: FloatGeometry, to: FloatGeometry) {
  * 先切按钮再切尺寸，插值失败时回滚按钮排列并把窗口恢复原状——
  * 修复：双屏交界处动画失败/被并发打断时"按钮垂直排列而窗口尺寸未变化"（两套触发逻辑分裂）。
  */
-async function applyOrientation(from: FloatGeometry, to: FloatGeometry) {
+async function applyOrientation(from: FloatGeometryBase, to: FloatGeometryBase) {
   const prev = vertical.value
   vertical.value = to.orientation === 'vertical'
   try {
@@ -436,17 +461,20 @@ onMounted(async () => {
   // 【FR-021】开启即对齐默认位置（水平居中 + 顶端吸附），
   // 不受"建窗时 position() 未生效 / 前端挂载早于后端定位"的时序影响
   await alignToDefault()
+  // 默认位置即顶端贴边：2s 后降透明度（与拖拽吸附行为一致）
+  scheduleDim(true)
 })
 
 onBeforeUnmount(() => {
   unmounted = true
   clearTimeout(moveTimer)
+  clearTimeout(dimTimer)
 })
 </script>
 
 <template>
   <!-- 根元素拦截右键：屏蔽 WebView 原生菜单（后退/刷新/检查） -->
-  <div class="float" :class="{ vertical }" @contextmenu.prevent>
+  <div class="float" :class="{ vertical, dimmed }" @contextmenu.prevent>
     <!-- 拖动手柄：原生 drag-region，释放时边缘吸附 -->
     <button class="grip" data-tauri-drag-region title="拖动移动（释放时边缘吸附）" aria-label="拖动移动">
       <FloatIcon name="grip" />
@@ -519,6 +547,9 @@ html, body, #app { background: transparent; }
   overflow: hidden;
 }
 .float:hover { opacity: 1; }
+/* 贴边吸附 2s 后透明度降到 35%（scheduleDim 控制 dimmed 类）；悬停立即恢复不透明，移出后仍回 35% */
+.float.dimmed { opacity: .35; }
+.float.dimmed:hover { opacity: 1; }
 .float.vertical { flex-direction: column; align-items: center; }
 
 /* ===== 拖动手柄（16x16） ===== */
