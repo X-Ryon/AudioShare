@@ -173,12 +173,17 @@ pub fn default_float_position(work: Rect, w: f64) -> (f64, f64) {
 /// work.y = -512），因此所有边距一律换算到【相对工作区原点】的坐标后再比较，
 /// 吸附结果再平移回绝对坐标。若直接拿绝对坐标与 work.w/work.h 比较，
 /// 副屏上会算出负边距（如 d_l = -2870），从而误判为"贴左"并把窗口吸到主屏边缘。
-pub fn snap_to_edge(rect: Rect, work: Rect, threshold: f64, current: Orientation, icon_count: usize) -> SnapResult {
+/// 【贴底·屏幕物理底】贴底判定与目标坐标用 monitor（rcMonitor，含任务栏区域），
+/// 其余三边用 work（rcWork）：底部吸附停在屏幕物理底边而非任务栏上沿。
+/// 【注意】返回坐标是【外层】口径；内层内容与屏幕边的隐形边框差由
+/// border_compensate 在吸附结果上补偿（见 snap_float 命令）。
+pub fn snap_to_edge(rect: Rect, work: Rect, monitor: Rect, threshold: f64, current: Orientation, icon_count: usize) -> SnapResult {
     // 相对工作区原点的坐标（副屏场景下可为负）
     let rel_x = rect.x - work.x;
     let rel_y = rect.y - work.y;
     let d_t = rel_y;
-    let d_b = work.h - (rel_y + rect.h);
+    // 贴底距屏底：窗口相对 monitor 底边的距离（monitor 与 work 顶部同高，rel_y 可直接复用）
+    let d_b = monitor.h - (rel_y + rect.h);
     let d_l = rel_x;
     let d_r = work.w - (rel_x + rect.w);
     let min = d_t.min(d_b).min(d_l).min(d_r);
@@ -193,7 +198,8 @@ pub fn snap_to_edge(rect: Rect, work: Rect, threshold: f64, current: Orientation
     if d_t == min {
         SnapResult { x: rect.x, y: work.y, orientation: Orientation::Horizontal, w: hw, h: hh }
     } else if d_b == min {
-        SnapResult { x: rect.x, y: work.y + work.h - hh, orientation: Orientation::Horizontal, w: hw, h: hh }
+        // 贴底：目标 y = 物理屏幕底 - 目标高（monitor 底，非 work 底）
+        SnapResult { x: rect.x, y: monitor.y + monitor.h - hh, orientation: Orientation::Horizontal, w: hw, h: hh }
     } else if d_l == min {
         SnapResult { x: work.x, y: rect.y, orientation: Orientation::Vertical, w: vw, h: vh }
     } else {
@@ -201,13 +207,52 @@ pub fn snap_to_edge(rect: Rect, work: Rect, threshold: f64, current: Orientation
     }
 }
 
+/// 贴边隐形边框补偿（坐标口径）：让窗口【内层】（可见内容）边缘恰好贴平屏幕边缘，内容完整可见。
+///
+/// Windows 无边框窗口仍带隐形边框（实测主屏 96dpi：左/右/底各 8px，顶 1px 阴影边），
+/// setPosition 设置的是【外层】位置，而 snap_to_edge 的贴边公式把外层位置当【内容】位置用，
+/// 内容实际还向外层内偏移（左 bl / 顶 bt），故贴边坐标一律【向外减】该偏移：
+/// - 贴左：外层左 = 屏幕左 - bl，内容左贴平 0
+/// - 贴右：外层左 = 屏幕右 - 内宽 - bl，内容右贴平屏幕右（若向外加则内容被屏幕边缘切掉）
+/// - 贴顶：外层顶 = 屏幕顶 - bt
+/// - 贴底：外层顶 = 屏幕底 - 内高 - bt，内容底贴平物理底
+///
+/// 参数 border = (左, 顶, 右, 底)，单位逻辑像素（由 window_borders 实测换算）。
+pub fn compensate_xy(x: f64, y: f64, w: f64, h: f64, work: Rect, monitor: Rect, border: (f64, f64, f64, f64)) -> (f64, f64) {
+    let (bl, bt, _br, _bb) = border;
+    let fx = if x == work.x {
+        x - bl // 贴左：内容左贴平
+    } else if x + w == monitor.x + monitor.w {
+        x - bl // 贴右：内容右贴平（减左边框，内容完整可见）
+    } else {
+        x
+    };
+    let fy = if y == work.y {
+        y - bt // 贴顶：内容顶贴平
+    } else if y + h == monitor.y + monitor.h {
+        y - bt // 贴底：内容底贴平物理底（减顶边框）
+    } else {
+        y
+    };
+    (fx, fy)
+}
+
+/// 贴边隐形边框补偿（SnapResult 口径）：compensate_xy 的包装，吸附结果专用
+pub fn border_compensate(r: SnapResult, work: Rect, monitor: Rect, border: (f64, f64, f64, f64)) -> SnapResult {
+    let (x, y) = compensate_xy(r.x, r.y, r.w, r.h, work, monitor, border);
+    SnapResult { x, y, ..r }
+}
+
 /// 越界修正：把窗口位置收进工作区（分辨率变化/拔显示器自愈）
 ///
 /// 【多显示器】钳制区间必须加上工作区原点 work.x/work.y，
 /// 否则副屏上的窗口会被强行拉回主屏坐标系（副屏在左侧时上限会算成负数）
-pub fn clamp_to_work_area(x: f64, y: f64, w: f64, h: f64, work: Rect) -> (f64, f64) {
-    let cx = if w >= work.w { work.x } else { x.clamp(work.x, work.x + work.w - w) };
-    let cy = if h >= work.h { work.y } else { y.clamp(work.y, work.y + work.h - h) };
+/// 【贴底·屏幕物理底】上限用 monitor 底/右：贴底吸附后窗口停在任务栏区域（物理底），
+/// 应用数变化触发本修正时不得把窗口拉回任务栏上方（否则贴底窗口会弹跳）。
+/// 下限仍用 work（顶部/左侧贴边时不得跑到任务栏后面）
+pub fn clamp_to_work_area(x: f64, y: f64, w: f64, h: f64, work: Rect, monitor: Rect) -> (f64, f64) {
+    let cx = if w >= monitor.w { monitor.x } else { x.clamp(work.x, monitor.x + monitor.w - w) };
+    let cy = if h >= monitor.h { monitor.y } else { y.clamp(work.y, monitor.y + monitor.h - h) };
     (cx, cy)
 }
 
@@ -235,14 +280,16 @@ pub fn anchor_adjust(rect: Rect, mut r: SnapResult, current: Orientation, work: 
 
 /// 手动旋转布局（FR-016）：水平 ↔ 垂直
 /// 旋转中心 = ⠿ 拖动手柄中心（与边缘吸附触发的布局切换同一锚点），切换后 clamp 进工作区
-pub fn rotate_to(rect: Rect, current: Orientation, work: Rect, icon_count: usize) -> SnapResult {
+pub fn rotate_to(rect: Rect, current: Orientation, work: Rect, monitor: Rect, icon_count: usize) -> SnapResult {
     let target = match current {
         Orientation::Horizontal => Orientation::Vertical,
         Orientation::Vertical => Orientation::Horizontal,
     };
     let raw = SnapResult { x: rect.x, y: rect.y, orientation: target, w: 0.0, h: 0.0 };
     let adj = anchor_adjust(rect, raw, current, work, icon_count);
-    let (cx, cy) = clamp_to_work_area(adj.x, adj.y, adj.w, adj.h, work);
+    // clamp 用无边框口径（下限 work），贴边窗口的边框补偿由命令层在 clamp 后恢复
+    // （否则贴左的负坐标会被 clamp 拉回，旋转后空隙重现）
+    let (cx, cy) = clamp_to_work_area(adj.x, adj.y, adj.w, adj.h, work, monitor);
     SnapResult { x: cx, y: cy, orientation: adj.orientation, w: adj.w, h: adj.h }
 }
 
@@ -286,10 +333,12 @@ pub fn save_float_config(app: &AppHandle, cfg: &FloatWindowConfig) {
 
 // ---------- 工作区查询与窗口生命周期（窗口 API 不做单测，真机验收覆盖） ----------
 
-/// 悬浮窗所在显示器工作区（GetMonitorInfoW rcWork，避开任务栏；【逻辑像素】）
-/// 【FR-024】rcWork 为物理像素，÷ 所在屏 scale factor 转逻辑：高 DPI 屏（如 2K@125%）下
+/// 悬浮窗所在显示器【物理屏幕矩形 + 工作区矩形】（【逻辑像素】，顺序：(monitor, work)）
+/// 【FR-024】rcMonitor/rcWork 为物理像素，÷ 所在屏 scale factor 转逻辑：高 DPI 屏（如 2K@125%）下
 /// 窗口 API 用逻辑尺寸时 WebView 视口 = 完整逻辑尺寸，几何若用物理口径会导致吸附错位。
-pub fn work_area_of_float_window(app: &AppHandle) -> Option<Rect> {
+/// 【贴底需求】贴底吸附目标为 rcMonitor 底（屏幕物理边缘），其余边距判定仍用 rcWork，
+/// 故两个矩形都要返回。
+pub fn screen_rects_of_float_window(app: &AppHandle) -> Option<(Rect, Rect)> {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::Graphics::Gdi::{
         GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
@@ -316,13 +365,31 @@ pub fn work_area_of_float_window(app: &AppHandle) -> Option<Rect> {
         } else {
             1.0
         };
-        Some(Rect {
+        let monitor = Rect {
+            x: info.rcMonitor.left as f64 / scale,
+            y: info.rcMonitor.top as f64 / scale,
+            w: (info.rcMonitor.right - info.rcMonitor.left) as f64 / scale,
+            h: (info.rcMonitor.bottom - info.rcMonitor.top) as f64 / scale,
+        };
+        let work = Rect {
             x: info.rcWork.left as f64 / scale,
             y: info.rcWork.top as f64 / scale,
             w: (info.rcWork.right - info.rcWork.left) as f64 / scale,
             h: (info.rcWork.bottom - info.rcWork.top) as f64 / scale,
-        })
+        };
+        Some((monitor, work))
     }
+}
+
+/// 悬浮窗所在显示器工作区（GetMonitorInfoW rcWork，避开任务栏；【逻辑像素】）
+pub fn work_area_of_float_window(app: &AppHandle) -> Option<Rect> {
+    screen_rects_of_float_window(app).map(|(_, work)| work)
+}
+
+/// 悬浮窗所在显示器物理屏幕矩形（GetMonitorInfoW rcMonitor；【逻辑像素】）
+/// 贴底吸附目标：屏幕物理底边，不受任务栏影响
+pub fn monitor_area_of_float_window(app: &AppHandle) -> Option<Rect> {
+    screen_rects_of_float_window(app).map(|(monitor, _)| monitor)
 }
 
 /// 创建悬浮窗窗口（label="float"，无边框置顶透明、不入任务栏、不可缩放；逻辑像素）
@@ -496,27 +563,48 @@ pub async fn set_float_enabled(app: AppHandle, on: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// 悬浮窗窗口隐形边框（逻辑像素，顺序：左/顶/右/底）。
+///
+/// Windows 无边框窗口仍带隐形边框：实测主屏 96dpi 左/右/底各 8px、顶 1px（tao 阴影边），
+/// 副屏 175% 下物理值相同（÷scale 转逻辑）。用于贴边吸附的坐标补偿（border_compensate）。
+/// 查询失败（如窗口未建）返回全 0（不补偿）。
+pub fn window_borders(app: &AppHandle) -> (f64, f64, f64, f64) {
+    let Some(w) = app.get_webview_window("float") else { return (0.0, 0.0, 0.0, 0.0) };
+    let Ok(scale) = w.scale_factor() else { return (0.0, 0.0, 0.0, 0.0) };
+    let (Ok(o), Ok(i)) = (w.outer_size(), w.inner_size()) else { return (0.0, 0.0, 0.0, 0.0) };
+    let dw = (o.width.saturating_sub(i.width)) as f64 / 2.0; // 左右各半
+    let dh = (o.height.saturating_sub(i.height)) as f64;
+    let bt = 1.0_f64.min(dh); // 顶部阴影边恒 1 物理 px（tao MARGINS 实测）
+    let bb = (dh - bt).max(0.0);
+    (dw / scale, bt / scale, dw / scale, bb / scale)
+}
+
 /// 边缘吸附（前端 onMoved 防抖 200ms 后调用）：当前方向按窗口尺寸推断（w>h=水平）；
-/// 布局切换时以 ⠿ 滑块为锚点补偿另一轴（消除窗口跳位）
+/// 布局切换时以 ⠿ 滑块为锚点补偿另一轴（消除窗口跳位）；
+/// 贴边结果再做隐形边框补偿（内层内容贴平屏幕边，见 border_compensate）。
 ///
 /// icon_count = 当前共享应用图标数（上限 3），决定目标布局下的窗口尺寸
 #[tauri::command]
 pub fn snap_float(app: AppHandle, x: f64, y: f64, w: f64, h: f64, icon_count: usize) -> Result<SnapResult, String> {
-    let work = work_area_of_float_window(&app).ok_or("无法获取显示器工作区")?;
+    let (monitor, work) = screen_rects_of_float_window(&app).ok_or("无法获取显示器工作区")?;
     let rect = Rect { x, y, w, h };
     let current = if w > h { Orientation::Horizontal } else { Orientation::Vertical };
-    let r = snap_to_edge(rect, work, SNAP_THRESHOLD, current, icon_count);
+    let r = snap_to_edge(rect, work, monitor, SNAP_THRESHOLD, current, icon_count);
+    let r = border_compensate(r, work, monitor, window_borders(&app));
     Ok(anchor_adjust(rect, r, current, work, icon_count))
 }
 
 /// 手动旋转布局（FR-016）：水平 ↔ 垂直
-/// 返回目标坐标与尺寸（逻辑像素），前端据此做 6 步插值过渡并落盘
+/// 返回目标坐标与尺寸（逻辑像素），前端据此做 6 步插值过渡并落盘；
+/// 旋转后若结果仍贴边，恢复隐形边框补偿（内层内容贴平屏幕边，与吸附路径一致）
 #[tauri::command]
 pub fn rotate_float(app: AppHandle, x: f64, y: f64, w: f64, h: f64, icon_count: usize) -> Result<SnapResult, String> {
-    let work = work_area_of_float_window(&app).ok_or("无法获取显示器工作区")?;
+    let (monitor, work) = screen_rects_of_float_window(&app).ok_or("无法获取显示器工作区")?;
     let rect = Rect { x, y, w, h };
     let current = if w > h { Orientation::Horizontal } else { Orientation::Vertical };
-    Ok(rotate_to(rect, current, work, icon_count))
+    let r = rotate_to(rect, current, work, monitor, icon_count);
+    let (fx, fy) = compensate_xy(r.x, r.y, r.w, r.h, work, monitor, window_borders(&app));
+    Ok(SnapResult { x: fx, y: fy, ..r })
 }
 
 /// 目标布局方向 + 应用图标数 → 窗口尺寸（逻辑像素）
@@ -527,11 +615,14 @@ pub fn float_target_size(orientation: String, icon_count: usize) -> (f64, f64) {
 }
 
 /// 尺寸调整后把窗口收进工作区（返回修正后的 x/y）
-/// 应用图标数变化 → 窗口变宽/变高 → 可能超出工作区，需拉回
+/// 应用图标数变化 → 窗口变宽/变高 → 可能超出工作区，需拉回；
+/// y 上限放行到物理屏幕底（贴底窗口尺寸变化时不弹回任务栏上方）；
+/// 修正后若仍贴边，恢复隐形边框补偿（贴左的负坐标不被 clamp 拉回后丢补偿）
 #[tauri::command]
 pub fn fit_float_position(app: AppHandle, x: f64, y: f64, w: f64, h: f64) -> Result<(f64, f64), String> {
-    let work = work_area_of_float_window(&app).ok_or("无法获取显示器工作区")?;
-    Ok(clamp_to_work_area(x, y, w, h, work))
+    let (monitor, work) = screen_rects_of_float_window(&app).ok_or("无法获取显示器工作区")?;
+    let (cx, cy) = clamp_to_work_area(x, y, w, h, work, monitor);
+    Ok(compensate_xy(cx, cy, w, h, work, monitor, window_borders(&app)))
 }
 
 /// 当前【默认位置】（FR-021）：按悬浮窗当前【外层】宽度计算的水平居中 + 顶端吸附坐标
@@ -581,31 +672,47 @@ mod tests {
         Rect { x: 0.0, y: 0.0, w: 1920.0, h: 1040.0 }
     }
 
+    /// 物理屏幕（rcMonitor）：高 1080，底部任务栏 40px（work 高 1040）
+    fn monitor() -> Rect {
+        Rect { x: 0.0, y: 0.0, w: 1920.0, h: 1080.0 }
+    }
+
     /// 共享应用图标数（上限 3，与前端 MAX_VISIBLE_ICONS 一致）
     const ICONS: usize = 3;
 
     /// TC-047：距顶 ≤ 阈值 → 贴顶，水平布局
     #[test]
     fn snap_to_top_edge_is_horizontal() {
-        let r = snap_to_edge(Rect { x: 600.0, y: 10.0, w: 299.0, h: 44.0 }, work(), SNAP_THRESHOLD, Orientation::Horizontal, ICONS);
+        let r = snap_to_edge(Rect { x: 600.0, y: 10.0, w: 299.0, h: 44.0 }, work(), monitor(), SNAP_THRESHOLD, Orientation::Horizontal, ICONS);
         assert_eq!(r.x, 600.0);
         assert_eq!(r.y, 0.0);
         assert_eq!(r.orientation, Orientation::Horizontal);
     }
 
-    /// TC-047：距底 ≤ 阈值 → 贴底，水平布局
+    /// TC-047：距屏底（物理底）≤ 阈值 → 贴底，水平布局（贴物理屏底而非任务栏上沿）
     #[test]
     fn snap_to_bottom_edge_is_horizontal() {
+        let monitor = monitor();
+        let r = snap_to_edge(Rect { x: 600.0, y: monitor.h - 44.0 - 15.0, w: 299.0, h: 44.0 }, work(), monitor, SNAP_THRESHOLD, Orientation::Horizontal, ICONS);
+        assert_eq!(r.y, monitor.h - 44.0);
+        assert_eq!(r.orientation, Orientation::Horizontal);
+    }
+
+    /// 贴底需求：窗口在任务栏上沿（work 底）附近时不吸附——必须贴近【屏幕物理底】才吸附
+    #[test]
+    fn no_bottom_snap_near_taskbar_edge() {
         let work = work();
-        let r = snap_to_edge(Rect { x: 600.0, y: work.h - 44.0 - 15.0, w: 299.0, h: 44.0 }, work, SNAP_THRESHOLD, Orientation::Horizontal, ICONS);
-        assert_eq!(r.y, work.h - 44.0);
+        // 窗口底在 work 底上方 8px（距物理底 48px > 阈值）→ 不吸附，原样返回
+        let rect = Rect { x: 600.0, y: work.h - 44.0 - 8.0, w: 299.0, h: 44.0 };
+        let r = snap_to_edge(rect, work, monitor(), SNAP_THRESHOLD, Orientation::Horizontal, ICONS);
+        assert_eq!((r.x, r.y), (600.0, work.h - 52.0));
         assert_eq!(r.orientation, Orientation::Horizontal);
     }
 
     /// TC-047/048：距左 ≤ 阈值 → 贴左，垂直布局
     #[test]
     fn snap_to_left_edge_is_vertical() {
-        let r = snap_to_edge(Rect { x: 12.0, y: 400.0, w: 299.0, h: 44.0 }, work(), SNAP_THRESHOLD, Orientation::Horizontal, ICONS);
+        let r = snap_to_edge(Rect { x: 12.0, y: 400.0, w: 299.0, h: 44.0 }, work(), monitor(), SNAP_THRESHOLD, Orientation::Horizontal, ICONS);
         assert_eq!(r.x, 0.0);
         assert_eq!(r.y, 400.0);
         assert_eq!(r.orientation, Orientation::Vertical);
@@ -615,26 +722,26 @@ mod tests {
     #[test]
     fn snap_to_right_edge_is_vertical() {
         let work = work();
-        let r = snap_to_edge(Rect { x: work.w - 299.0 - 8.0, y: 400.0, w: 299.0, h: 44.0 }, work, SNAP_THRESHOLD, Orientation::Horizontal, ICONS);
+        let r = snap_to_edge(Rect { x: work.w - 299.0 - 8.0, y: 400.0, w: 299.0, h: 44.0 }, work, monitor(), SNAP_THRESHOLD, Orientation::Horizontal, ICONS);
         assert_eq!(r.x, work.w - target_size(Orientation::Vertical, ICONS).0);
         assert_eq!(r.orientation, Orientation::Vertical);
     }
 
-    /// 验收反馈：垂直窗拖到右边缘 → 贴右且右边缘贴齐（切换后无悬空/错位）
+    /// 验收反馈：垂直窗拖到屏幕底 → 贴底且底边缘贴齐物理屏底（切换后无悬空/错位）
     #[test]
     fn snap_to_bottom_from_vertical_uses_target_height() {
-        let work = work();
-        // 垂直窗（48×287）底部距屏幕底 8px → 贴底 → 水平窗（299×44）底部必须贴齐
-        let r = snap_to_edge(Rect { x: 600.0, y: work.h - 287.0 - 8.0, w: 48.0, h: 287.0 }, work, SNAP_THRESHOLD, Orientation::Vertical, ICONS);
+        let monitor = monitor();
+        // 垂直窗（48×287）底部距屏底 8px → 贴底 → 水平窗（299×44）底部必须贴齐物理屏底
+        let r = snap_to_edge(Rect { x: 600.0, y: monitor.h - 287.0 - 8.0, w: 48.0, h: 287.0 }, work(), monitor, SNAP_THRESHOLD, Orientation::Vertical, ICONS);
         assert_eq!(r.orientation, Orientation::Horizontal);
-        assert_eq!(r.y, work.h - target_size(Orientation::Horizontal, ICONS).1); // 996 = 1040 - 44
+        assert_eq!(r.y, monitor.h - target_size(Orientation::Horizontal, ICONS).1); // 1036 = 1080 - 44
     }
 
     /// 阈值外不吸附：位置不变、方向保持传入值（含从垂直拖回中间）
     #[test]
     fn no_snap_when_far_from_edges() {
         let rect = Rect { x: 500.0, y: 500.0, w: 299.0, h: 44.0 };
-        let r = snap_to_edge(rect, work(), SNAP_THRESHOLD, Orientation::Vertical, ICONS);
+        let r = snap_to_edge(rect, work(), monitor(), SNAP_THRESHOLD, Orientation::Vertical, ICONS);
         assert_eq!((r.x, r.y), (500.0, 500.0));
         assert_eq!(r.orientation, Orientation::Vertical); // 自由位置方向由调用方决定
     }
@@ -642,7 +749,7 @@ mod tests {
     /// 恰等于阈值 → 吸附（≤ 判定）
     #[test]
     fn snap_at_exact_threshold() {
-        let r = snap_to_edge(Rect { x: SNAP_THRESHOLD, y: 400.0, w: 299.0, h: 44.0 }, work(), SNAP_THRESHOLD, Orientation::Horizontal, ICONS);
+        let r = snap_to_edge(Rect { x: SNAP_THRESHOLD, y: 400.0, w: 299.0, h: 44.0 }, work(), monitor(), SNAP_THRESHOLD, Orientation::Horizontal, ICONS);
         assert_eq!(r.x, 0.0);
         assert_eq!(r.orientation, Orientation::Vertical);
     }
@@ -651,36 +758,103 @@ mod tests {
     #[test]
     fn tie_break_priority_top_bottom_left_right() {
         let work = work();
+        let monitor = monitor();
         // 四边全贴（左上角 0,0）：dT=dL=0 并列 → 顶优先：水平贴顶
-        let r = snap_to_edge(Rect { x: 0.0, y: 0.0, w: 299.0, h: 44.0 }, work, SNAP_THRESHOLD, Orientation::Horizontal, ICONS);
+        let r = snap_to_edge(Rect { x: 0.0, y: 0.0, w: 299.0, h: 44.0 }, work, monitor, SNAP_THRESHOLD, Orientation::Horizontal, ICONS);
         assert_eq!(r.orientation, Orientation::Horizontal);
         assert_eq!((r.x, r.y), (0.0, 0.0));
         // dT 与 dR 并列（右上角 8px）→ 顶优先：水平贴顶
-        let r2 = snap_to_edge(Rect { x: work.w - 299.0 - 8.0, y: 8.0, w: 299.0, h: 44.0 }, work, SNAP_THRESHOLD, Orientation::Horizontal, ICONS);
+        let r2 = snap_to_edge(Rect { x: work.w - 299.0 - 8.0, y: 8.0, w: 299.0, h: 44.0 }, work, monitor, SNAP_THRESHOLD, Orientation::Horizontal, ICONS);
         assert_eq!(r2.orientation, Orientation::Horizontal);
         assert_eq!(r2.y, 0.0);
-        // dB 与 dL 并列（左下角 8px）→ 底优先（底在左前）：水平贴底
-        let r3 = snap_to_edge(Rect { x: 8.0, y: work.h - 44.0 - 8.0, w: 299.0, h: 44.0 }, work, SNAP_THRESHOLD, Orientation::Horizontal, ICONS);
+        // dB 与 dL 并列（左下角 8px，dB 相对物理屏底）→ 底优先（底在左前）：水平贴底
+        let r3 = snap_to_edge(Rect { x: 8.0, y: monitor.h - 44.0 - 8.0, w: 299.0, h: 44.0 }, work, monitor, SNAP_THRESHOLD, Orientation::Horizontal, ICONS);
         assert_eq!(r3.orientation, Orientation::Horizontal);
-        assert_eq!((r3.x, r3.y), (8.0, work.h - 44.0));
+        assert_eq!((r3.x, r3.y), (8.0, monitor.h - 44.0));
         // dB 与 dR 并列（右下角 6px）→ 底优先：水平贴底
-        let r4 = snap_to_edge(Rect { x: work.w - 299.0 - 6.0, y: work.h - 44.0 - 6.0, w: 299.0, h: 44.0 }, work, SNAP_THRESHOLD, Orientation::Horizontal, ICONS);
+        let r4 = snap_to_edge(Rect { x: work.w - 299.0 - 6.0, y: monitor.h - 44.0 - 6.0, w: 299.0, h: 44.0 }, work, monitor, SNAP_THRESHOLD, Orientation::Horizontal, ICONS);
         assert_eq!(r4.orientation, Orientation::Horizontal);
-        assert_eq!(r4.y, work.h - 44.0);
+        assert_eq!(r4.y, monitor.h - 44.0);
     }
 
-    /// TC-057：越界四向均拉回工作区
+    /// TC-057：越界四向均拉回工作区（y 上限放行到屏幕物理底，贴底窗口不被拉回任务栏上方）
     #[test]
     fn clamp_pulls_into_work_area() {
         let work = work();
+        let monitor = monitor();
         // 左上越界
-        assert_eq!(clamp_to_work_area(-50.0, -30.0, 232.0, 44.0, work), (0.0, 0.0));
-        // 右下越界
-        assert_eq!(clamp_to_work_area(2000.0, 1200.0, 232.0, 44.0, work), (work.w - 232.0, work.h - 44.0));
+        assert_eq!(clamp_to_work_area(-50.0, -30.0, 232.0, 44.0, work, monitor), (0.0, 0.0));
+        // 右下越界（y 上限 = 物理屏底 - 高 = 1036，而非 work 底 996）
+        assert_eq!(clamp_to_work_area(2000.0, 1200.0, 232.0, 44.0, work, monitor), (work.w - 232.0, monitor.h - 44.0));
         // 区内不动
-        assert_eq!(clamp_to_work_area(600.0, 400.0, 232.0, 44.0, work), (600.0, 400.0));
+        assert_eq!(clamp_to_work_area(600.0, 400.0, 232.0, 44.0, work, monitor), (600.0, 400.0));
         // 窗口大于工作区：贴左上
-        assert_eq!(clamp_to_work_area(100.0, 100.0, 3000.0, 2000.0, work), (0.0, 0.0));
+        assert_eq!(clamp_to_work_area(100.0, 100.0, 3000.0, 2000.0, work, monitor), (0.0, 0.0));
+    }
+
+    /// 贴边隐形边框补偿：贴哪边就把内容在外层内的偏移向外减（左/右减 bl、顶/底减 bt），
+    /// 使内层（可见内容）边缘恰好贴平屏幕、内容完整可见；非贴边不动
+    #[test]
+    fn border_compensate_flushes_content_to_edge() {
+        let work = work();
+        let monitor = monitor();
+        // 主屏 96dpi 实测边框：左/右/底 8px、顶 1px（逻辑像素）
+        let border = (8.0, 1.0, 8.0, 8.0);
+        // 贴左（垂直 48 宽）→ x 向外减 8，内容左 = 0
+        let left = SnapResult { x: 0.0, y: 400.0, orientation: Orientation::Vertical, w: 48.0, h: 287.0 };
+        let r = border_compensate(left, work, monitor, border);
+        assert_eq!((r.x, r.y), (-8.0, 400.0));
+        // 贴右 → x 向外减 8，内容右 = 1920 完整可见（不得超出被屏幕切掉）
+        let right = SnapResult { x: work.w - 48.0, y: 400.0, orientation: Orientation::Vertical, w: 48.0, h: 287.0 };
+        let r = border_compensate(right, work, monitor, border);
+        assert_eq!((r.x, r.y), (work.w - 48.0 - 8.0, 400.0));
+        assert_eq!(r.x + 8.0 + r.w, 1920.0); // 内容右缘恰好贴平屏幕右缘
+        // 贴顶 → y 向外减 1
+        let top = SnapResult { x: 600.0, y: 0.0, orientation: Orientation::Horizontal, w: 299.0, h: 44.0 };
+        let r = border_compensate(top, work, monitor, border);
+        assert_eq!((r.x, r.y), (600.0, -1.0));
+        // 贴底（屏幕物理底）→ y 向外减 1，内容底 = 1080 贴平物理底
+        let bottom = SnapResult { x: 600.0, y: monitor.h - 44.0, orientation: Orientation::Horizontal, w: 299.0, h: 44.0 };
+        let r = border_compensate(bottom, work, monitor, border);
+        assert_eq!((r.x, r.y), (600.0, monitor.h - 44.0 - 1.0));
+        assert_eq!(r.y + 1.0 + r.h, 1080.0); // 内容底缘恰好贴平物理屏底
+        // 非贴边 → 原样返回
+        let free = SnapResult { x: 600.0, y: 400.0, orientation: Orientation::Horizontal, w: 299.0, h: 44.0 };
+        let r = border_compensate(free, work, monitor, border);
+        assert_eq!((r.x, r.y), (600.0, 400.0));
+    }
+
+    /// 补偿坐标口径：贴边一律向外减内容偏移（左/右减 bl、顶/底减 bt），内容边缘贴平屏幕；非贴边不动
+    #[test]
+    fn compensate_xy_flushes_content_to_edge() {
+        let work = work();
+        let monitor = monitor();
+        let border = (8.0, 1.0, 8.0, 8.0);
+        // 贴左
+        assert_eq!(compensate_xy(0.0, 400.0, 48.0, 287.0, work, monitor, border), (-8.0, 400.0));
+        // 贴右（monitor 右缘口径）→ 减 bl，内容右 = 1920 完整可见
+        let (rx, ry) = compensate_xy(monitor.w - 48.0, 400.0, 48.0, 287.0, work, monitor, border);
+        assert_eq!((rx, ry), (monitor.w - 48.0 - 8.0, 400.0));
+        assert_eq!(rx + 8.0 + 48.0, monitor.w);
+        // 贴顶
+        assert_eq!(compensate_xy(600.0, 0.0, 299.0, 44.0, work, monitor, border), (600.0, -1.0));
+        // 贴底（monitor 物理底口径）→ 减 bt，内容底 = 1080 贴平
+        let (bx, by) = compensate_xy(600.0, monitor.h - 44.0, 299.0, 44.0, work, monitor, border);
+        assert_eq!((bx, by), (600.0, monitor.h - 44.0 - 1.0));
+        assert_eq!(by + 1.0 + 44.0, monitor.h);
+        // 非贴边 → 原样
+        assert_eq!(compensate_xy(600.0, 400.0, 299.0, 44.0, work, monitor, border), (600.0, 400.0));
+    }
+
+    /// 贴左窗口（补偿后 x=-8）经 clamp 拉回 0 后，补偿恢复 -8（fit/rotate 命令路径，空隙不重现）
+    #[test]
+    fn clamp_then_compensate_keeps_left_flush() {
+        let work = work();
+        let monitor = monitor();
+        let border = (8.0, 1.0, 8.0, 8.0);
+        let (cx, cy) = clamp_to_work_area(-8.0, 400.0, 48.0, 287.0, work, monitor);
+        assert_eq!((cx, cy), (0.0, 400.0)); // clamp 拉回屏幕边
+        assert_eq!(compensate_xy(cx, cy, 48.0, 287.0, work, monitor, border), (-8.0, 400.0)); // 恢复补偿
     }
 
     /// 默认居中：工作区几何中心
@@ -732,13 +906,18 @@ mod tests {
         Rect { x: -2880.0, y: -512.0, w: 1646.0, h: 981.0 }
     }
 
+    /// 副屏物理屏幕（rcMonitor）：高 1029，底部任务栏 48px（work 高 981）
+    fn secondary_monitor() -> Rect {
+        Rect { x: -2880.0, y: -512.0, w: 1646.0, h: 1029.0 }
+    }
+
     /// FR-022：拖到副屏左边缘 → 吸附到【副屏】左边缘（x = work.x），不得跳回主屏（x = 0）
     #[test]
     fn snap_left_on_secondary_screen_stays_on_it() {
         let work = secondary_work();
         let r = snap_to_edge(
             Rect { x: work.x + 10.0, y: -200.0, w: 299.0, h: 44.0 },
-            work, SNAP_THRESHOLD, Orientation::Horizontal, ICONS,
+            work, secondary_monitor(), SNAP_THRESHOLD, Orientation::Horizontal, ICONS,
         );
         assert_eq!(r.orientation, Orientation::Vertical);
         assert_eq!(r.x, work.x); // -2880：副屏左边缘
@@ -751,7 +930,7 @@ mod tests {
         let work = secondary_work();
         let r = snap_to_edge(
             Rect { x: -2000.0, y: work.y + 5.0, w: 299.0, h: 44.0 },
-            work, SNAP_THRESHOLD, Orientation::Horizontal, ICONS,
+            work, secondary_monitor(), SNAP_THRESHOLD, Orientation::Horizontal, ICONS,
         );
         assert_eq!(r.orientation, Orientation::Horizontal);
         assert_eq!(r.y, work.y); // -512：副屏顶端
@@ -764,22 +943,23 @@ mod tests {
         let work = secondary_work();
         let r = snap_to_edge(
             Rect { x: work.x + work.w - 299.0 - 8.0, y: -100.0, w: 299.0, h: 44.0 },
-            work, SNAP_THRESHOLD, Orientation::Horizontal, ICONS,
+            work, secondary_monitor(), SNAP_THRESHOLD, Orientation::Horizontal, ICONS,
         );
         assert_eq!(r.orientation, Orientation::Vertical);
         assert_eq!(r.x, work.x + work.w - target_size(Orientation::Vertical, ICONS).0);
     }
 
-    /// FR-022：拖到副屏底边缘 → 吸附到副屏底端（y = work.y + work.h - 目标水平高）
+    /// FR-022：拖到副屏底边缘 → 吸附到副屏【物理底端】（y = monitor.y + monitor.h - 目标水平高）
     #[test]
     fn snap_bottom_on_secondary_screen_stays_on_it() {
         let work = secondary_work();
+        let monitor = secondary_monitor();
         let r = snap_to_edge(
-            Rect { x: -2000.0, y: work.y + work.h - 44.0 - 8.0, w: 299.0, h: 44.0 },
-            work, SNAP_THRESHOLD, Orientation::Horizontal, ICONS,
+            Rect { x: -2000.0, y: monitor.y + monitor.h - 44.0 - 8.0, w: 299.0, h: 44.0 },
+            work, monitor, SNAP_THRESHOLD, Orientation::Horizontal, ICONS,
         );
         assert_eq!(r.orientation, Orientation::Horizontal);
-        assert_eq!(r.y, work.y + work.h - target_size(Orientation::Horizontal, ICONS).1);
+        assert_eq!(r.y, monitor.y + monitor.h - target_size(Orientation::Horizontal, ICONS).1); // 473
     }
 
     /// FR-022：副屏上远离边缘 → 不吸附，且位置保持绝对坐标不变
@@ -787,23 +967,25 @@ mod tests {
     fn no_snap_inside_secondary_screen_keeps_absolute_pos() {
         let work = secondary_work();
         let rect = Rect { x: -2000.0, y: -100.0, w: 299.0, h: 44.0 };
-        let r = snap_to_edge(rect, work, SNAP_THRESHOLD, Orientation::Horizontal, ICONS);
+        let r = snap_to_edge(rect, work, secondary_monitor(), SNAP_THRESHOLD, Orientation::Horizontal, ICONS);
         assert_eq!((r.x, r.y), (-2000.0, -100.0));
     }
 
-    /// FR-022：越界修正必须钳制在【副屏】工作区内，不得拉回主屏坐标系
+    /// FR-022：越界修正必须钳制在【副屏】内，不得拉回主屏坐标系
+    /// （y 上限放行到副屏物理底 473，贴底窗口尺寸变化时不弹回任务栏上方）
     #[test]
     fn clamp_stays_in_secondary_work_area() {
         let work = secondary_work();
+        let monitor = secondary_monitor();
         // 完全越界（左上）→ 副屏左上角
-        assert_eq!(clamp_to_work_area(-4000.0, -900.0, 299.0, 44.0, work), (work.x, work.y));
-        // 右下越界 → 副屏右下角（y=500 超出下边界 425）
+        assert_eq!(clamp_to_work_area(-4000.0, -900.0, 299.0, 44.0, work, monitor), (work.x, work.y));
+        // 右下越界 → 副屏右下角（y 上限 = 物理底 473）
         assert_eq!(
-            clamp_to_work_area(0.0, 500.0, 299.0, 44.0, work),
-            (work.x + work.w - 299.0, work.y + work.h - 44.0)
+            clamp_to_work_area(0.0, 500.0, 299.0, 44.0, work, monitor),
+            (work.x + work.w - 299.0, monitor.y + monitor.h - 44.0)
         );
         // 区内不动
-        assert_eq!(clamp_to_work_area(-2000.0, -100.0, 299.0, 44.0, work), (-2000.0, -100.0));
+        assert_eq!(clamp_to_work_area(-2000.0, -100.0, 299.0, 44.0, work, monitor), (-2000.0, -100.0));
     }
 
     /// FR-022：副屏上的锚点补偿结果仍落在副屏工作区内（不跳主屏）
@@ -811,7 +993,7 @@ mod tests {
     fn anchor_adjust_on_secondary_screen_stays_in_it() {
         let work = secondary_work();
         let rect = Rect { x: work.x + 8.0, y: -100.0, w: 299.0, h: 44.0 };
-        let r = snap_to_edge(rect, work, SNAP_THRESHOLD, Orientation::Horizontal, ICONS);
+        let r = snap_to_edge(rect, work, secondary_monitor(), SNAP_THRESHOLD, Orientation::Horizontal, ICONS);
         let r = anchor_adjust(rect, r, Orientation::Horizontal, work, ICONS);
         assert_eq!(r.orientation, Orientation::Vertical);
         assert_eq!(r.x, work.x);
@@ -834,7 +1016,7 @@ mod tests {
     #[test]
     fn anchor_adjust_h_to_v_keeps_slider_center() {
         let rect = Rect { x: 12.0, y: 400.0, w: 299.0, h: 44.0 };
-        let r = snap_to_edge(rect, work(), SNAP_THRESHOLD, Orientation::Horizontal, ICONS);
+        let r = snap_to_edge(rect, work(), monitor(), SNAP_THRESHOLD, Orientation::Horizontal, ICONS);
         let r = anchor_adjust(rect, r, Orientation::Horizontal, work(), ICONS);
         assert_eq!(r.orientation, Orientation::Vertical);
         assert_eq!(r.x, 0.0); // 贴边轴不变
@@ -845,7 +1027,7 @@ mod tests {
     #[test]
     fn anchor_adjust_v_to_h_keeps_slider_center() {
         let rect = Rect { x: 500.0, y: 5.0, w: 48.0, h: 287.0 };
-        let r = snap_to_edge(rect, work(), SNAP_THRESHOLD, Orientation::Vertical, ICONS);
+        let r = snap_to_edge(rect, work(), monitor(), SNAP_THRESHOLD, Orientation::Vertical, ICONS);
         let r = anchor_adjust(rect, r, Orientation::Vertical, work(), ICONS);
         assert_eq!(r.orientation, Orientation::Horizontal);
         assert_eq!(r.y, 0.0); // 贴边轴不变
@@ -858,7 +1040,7 @@ mod tests {
         let work = work();
         // 距左 8px（距底 96px 超阈值）→ 左侧吸附 → 垂直；滑块中心 y=922 越界 → clamp 到底
         let rect2 = Rect { x: 8.0, y: 900.0, w: 299.0, h: 44.0 };
-        let r2 = snap_to_edge(rect2, work, SNAP_THRESHOLD, Orientation::Horizontal, ICONS);
+        let r2 = snap_to_edge(rect2, work, monitor(), SNAP_THRESHOLD, Orientation::Horizontal, ICONS);
         assert_eq!(r2.orientation, Orientation::Vertical);
         let r2 = anchor_adjust(rect2, r2, Orientation::Horizontal, work, ICONS);
         assert_eq!(r2.x, 0.0);
@@ -869,7 +1051,7 @@ mod tests {
     #[test]
     fn anchor_adjust_same_orientation_noop() {
         let rect = Rect { x: 600.0, y: 10.0, w: 299.0, h: 44.0 };
-        let r = snap_to_edge(rect, work(), SNAP_THRESHOLD, Orientation::Horizontal, ICONS);
+        let r = snap_to_edge(rect, work(), monitor(), SNAP_THRESHOLD, Orientation::Horizontal, ICONS);
         let r2 = anchor_adjust(rect, r, Orientation::Horizontal, work(), ICONS);
         assert_eq!((r2.x, r2.y), (r.x, r.y));
     }
@@ -879,20 +1061,21 @@ mod tests {
     fn anchor_adjust_snap_right_no_misalignment() {
         let work = work();
         let rect = Rect { x: work.w - 299.0 - 8.0, y: 400.0, w: 299.0, h: 44.0 };
-        let r = snap_to_edge(rect, work, SNAP_THRESHOLD, Orientation::Horizontal, ICONS);
+        let r = snap_to_edge(rect, work, monitor(), SNAP_THRESHOLD, Orientation::Horizontal, ICONS);
         let r = anchor_adjust(rect, r, Orientation::Horizontal, work, ICONS);
         assert_eq!(r.x, work.w - target_size(Orientation::Vertical, ICONS).0); // 贴右：右边缘 work.w
         assert_eq!(r.y, 400.0 + 22.0 - SLIDER_AXIS_OFFSET); // 滑块 y 中心不动
     }
 
-    /// 验收反馈：贴底切换（垂直→水平）底边缘贴齐 + x 按滑块锚点补偿，无错位
+    /// 验收反馈：贴底切换（垂直→水平）底边缘贴齐 + x 按滑块锚点补偿，无错位（贴屏幕物理底）
     #[test]
     fn anchor_adjust_snap_bottom_no_misalignment() {
         let work = work();
-        let rect = Rect { x: 600.0, y: work.h - 287.0 - 8.0, w: 48.0, h: 287.0 };
-        let r = snap_to_edge(rect, work, SNAP_THRESHOLD, Orientation::Vertical, ICONS);
+        let monitor = monitor();
+        let rect = Rect { x: 600.0, y: monitor.h - 287.0 - 8.0, w: 48.0, h: 287.0 };
+        let r = snap_to_edge(rect, work, monitor, SNAP_THRESHOLD, Orientation::Vertical, ICONS);
         let r = anchor_adjust(rect, r, Orientation::Vertical, work, ICONS);
-        assert_eq!(r.y, work.h - target_size(Orientation::Horizontal, ICONS).1); // 贴底：底边缘 work.h
+        assert_eq!(r.y, monitor.h - target_size(Orientation::Horizontal, ICONS).1); // 贴底：底边缘 monitor.h
         assert_eq!(r.x, 600.0 + 48.0 / 2.0 - SLIDER_AXIS_OFFSET); // 滑块 x 中心不动
     }
 
@@ -940,7 +1123,7 @@ mod tests {
     #[test]
     fn rotate_to_horizontal_to_vertical_keeps_grip_center() {
         let rect = Rect { x: 600.0, y: 400.0, w: 299.0, h: 44.0 };
-        let r = rotate_to(rect, Orientation::Horizontal, work(), ICONS);
+        let r = rotate_to(rect, Orientation::Horizontal, work(), monitor(), ICONS);
         assert_eq!(r.orientation, Orientation::Vertical);
         assert_eq!(r.w, target_size(Orientation::Vertical, ICONS).0);
         assert_eq!(r.h, target_size(Orientation::Vertical, ICONS).1);
@@ -954,7 +1137,7 @@ mod tests {
     #[test]
     fn rotate_to_vertical_to_horizontal_keeps_grip_center() {
         let rect = Rect { x: 500.0, y: 100.0, w: 48.0, h: 287.0 };
-        let r = rotate_to(rect, Orientation::Vertical, work(), ICONS);
+        let r = rotate_to(rect, Orientation::Vertical, work(), monitor(), ICONS);
         assert_eq!(r.orientation, Orientation::Horizontal);
         assert_eq!(r.w, target_size(Orientation::Horizontal, ICONS).0);
         assert_eq!(r.h, target_size(Orientation::Horizontal, ICONS).1);
@@ -963,30 +1146,31 @@ mod tests {
         assert_eq!(r.y, 100.0);
     }
 
-    /// 旋转后越界 → clamp 进工作区（转水平后右边缘对齐；底部越界则拉回）
-    /// 注：锚点补偿只作用于“变化轴”（V→H 补偿 x，y 保持不变），故 y 不自动贴底
+    /// 旋转后越界 → clamp 进工作区（转水平后右边缘对齐；底部越界则拉回屏幕物理底上方）
+    /// 注：锚点补偿只作用于"变化轴"（V→H 补偿 x，y 保持不变），故 y 不自动贴底
     #[test]
     fn rotate_to_clamps_into_work_area() {
         let work = work();
+        let monitor = monitor();
         // 垂直窗位于右下角 → 转水平后右边缘贴齐，顶边位置保持
         let rect = Rect { x: work.w - 48.0 - 20.0, y: work.h - 287.0 - 20.0, w: 48.0, h: 287.0 };
-        let r = rotate_to(rect, Orientation::Vertical, work, ICONS);
+        let r = rotate_to(rect, Orientation::Vertical, work, monitor, ICONS);
         assert_eq!(r.orientation, Orientation::Horizontal);
         assert_eq!(r.x, work.w - target_size(Orientation::Horizontal, ICONS).0);
         assert_eq!(r.y, work.h - 287.0 - 20.0);
-        // 旋转后底部越界 → 拉回工作区
-        let rect2 = Rect { x: 100.0, y: 1000.0, w: 48.0, h: 287.0 };
-        let r2 = rotate_to(rect2, Orientation::Vertical, work, ICONS);
-        assert_eq!(r2.y, work.h - target_size(Orientation::Horizontal, ICONS).1);
+        // 旋转后底部越界（顶部位于任务栏区域 1040）→ y 上限放行到物理底上方：monitor.h - 44
+        let rect2 = Rect { x: 100.0, y: 1040.0, w: 48.0, h: 287.0 };
+        let r2 = rotate_to(rect2, Orientation::Vertical, work, monitor, ICONS);
+        assert_eq!(r2.y, monitor.h - target_size(Orientation::Horizontal, ICONS).1);
     }
 
     /// 旋转目标尺寸始终与方向匹配（前端直接用 r.w/r.h 做 setSize）
     #[test]
     fn rotate_result_size_matches_orientation() {
         let rect = Rect { x: 600.0, y: 400.0, w: 299.0, h: 44.0 };
-        let r = rotate_to(rect, Orientation::Horizontal, work(), ICONS);
+        let r = rotate_to(rect, Orientation::Horizontal, work(), monitor(), ICONS);
         assert_eq!((r.w, r.h), target_size(r.orientation, ICONS));
-        let r2 = rotate_to(rect, Orientation::Vertical, work(), ICONS);
+        let r2 = rotate_to(rect, Orientation::Vertical, work(), monitor(), ICONS);
         assert_eq!((r2.w, r2.h), target_size(r2.orientation, ICONS));
     }
 
@@ -994,9 +1178,9 @@ mod tests {
     #[test]
     fn rotate_target_size_follows_icon_count() {
         let rect = Rect { x: 600.0, y: 400.0, w: 231.0, h: 44.0 };
-        let r = rotate_to(rect, Orientation::Horizontal, work(), 0);
+        let r = rotate_to(rect, Orientation::Horizontal, work(), monitor(), 0);
         assert_eq!((r.w, r.h), (48.0, 219.0));
-        let r3 = rotate_to(rect, Orientation::Horizontal, work(), 3);
+        let r3 = rotate_to(rect, Orientation::Horizontal, work(), monitor(), 3);
         assert_eq!((r3.w, r3.h), (48.0, 287.0));
     }
 

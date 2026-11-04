@@ -13,10 +13,10 @@ use audioshare_lib::float_window::{
 use windows::Win32::Foundation::{LPARAM, RECT};
 use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO};
 
-/// 枚举本机全部显示器的工作区（rcWork，物理像素）
-fn list_work_areas() -> Vec<Rect> {
+/// 枚举本机全部显示器的（物理屏幕 rcMonitor，工作区 rcWork），均为物理像素
+fn list_screens() -> Vec<(Rect, Rect)> {
     thread_local! {
-        static WORKS: std::cell::RefCell<Vec<Rect>> = const { std::cell::RefCell::new(Vec::new()) };
+        static SCREENS: std::cell::RefCell<Vec<(Rect, Rect)>> = const { std::cell::RefCell::new(Vec::new()) };
     }
     unsafe extern "system" fn cb(
         hmon: HMONITOR,
@@ -27,21 +27,26 @@ fn list_work_areas() -> Vec<Rect> {
         let mut info = MONITORINFO::default();
         info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
         if GetMonitorInfoW(hmon, &mut info).as_bool() {
-            WORKS.with(|w| {
-                w.borrow_mut().push(Rect {
-                    x: info.rcWork.left as f64,
-                    y: info.rcWork.top as f64,
-                    w: (info.rcWork.right - info.rcWork.left) as f64,
-                    h: (info.rcWork.bottom - info.rcWork.top) as f64,
-                })
-            });
+            let monitor = Rect {
+                x: info.rcMonitor.left as f64,
+                y: info.rcMonitor.top as f64,
+                w: (info.rcMonitor.right - info.rcMonitor.left) as f64,
+                h: (info.rcMonitor.bottom - info.rcMonitor.top) as f64,
+            };
+            let work = Rect {
+                x: info.rcWork.left as f64,
+                y: info.rcWork.top as f64,
+                w: (info.rcWork.right - info.rcWork.left) as f64,
+                h: (info.rcWork.bottom - info.rcWork.top) as f64,
+            };
+            SCREENS.with(|w| w.borrow_mut().push((monitor, work)));
         }
         windows::core::BOOL(1)
     }
     unsafe {
         EnumDisplayMonitors(None, None, Some(cb), LPARAM(0));
     }
-    WORKS.with(|w| w.borrow().clone())
+    SCREENS.with(|w| w.borrow().clone())
 }
 
 fn inside(r: Rect, x: f64, y: f64) -> bool {
@@ -49,14 +54,17 @@ fn inside(r: Rect, x: f64, y: f64) -> bool {
 }
 
 fn main() {
-    let works = list_work_areas();
-    println!("== 本机显示器工作区（rcWork，物理像素）==");
-    for (i, w) in works.iter().enumerate() {
-        let kind = if w.x == 0.0 && w.y == 0.0 { "主屏" } else { "副屏" };
-        println!("  [{i}] {kind} work=({},{}) {}x{}", w.x, w.y, w.w, w.h);
+    let screens = list_screens();
+    println!("== 本机显示器（rcMonitor / rcWork，物理像素）==");
+    for (i, (m, w)) in screens.iter().enumerate() {
+        let kind = if m.x == 0.0 && m.y == 0.0 { "主屏" } else { "副屏" };
+        println!(
+            "  [{i}] {kind} monitor=({},{}) {}x{}  work=({},{}) {}x{}",
+            m.x, m.y, m.w, m.h, w.x, w.y, w.w, w.h
+        );
     }
-    if works.len() < 2 {
-        println!("RESULT=SKIP 本机仅 {} 块显示器，无法验证双屏", works.len());
+    if screens.len() < 2 {
+        println!("RESULT=SKIP 本机仅 {} 块显示器，无法验证双屏", screens.len());
         return;
     }
 
@@ -64,9 +72,9 @@ fn main() {
     let mut fail = 0usize;
     let mut total = 0usize;
 
-    // ---------- 1) 逐屏逐边吸附：结果必须落在【本屏】工作区内 ----------
+    // ---------- 1) 逐屏逐边吸附：结果必须落在【本屏】内（贴底停在任务栏区域，仍属本屏物理屏） ----------
     println!("\n== 吸附验证（拖到各屏边缘释放）==");
-    for (i, work) in works.iter().enumerate() {
+    for (i, (monitor, work)) in screens.iter().enumerate() {
         let cases: Vec<(&str, Rect, Orientation)> = vec![
             (
                 "贴左",
@@ -84,8 +92,9 @@ fn main() {
                 Orientation::Horizontal,
             ),
             (
+                // 贴下：距【屏幕物理底】（rcMonitor）8px 才吸附，目标 = 物理底而非任务栏上沿
                 "贴下",
-                Rect { x: work.x + 200.0, y: work.y + work.h - 44.0 - 8.0, w: 299.0, h: 44.0 },
+                Rect { x: work.x + 200.0, y: monitor.y + monitor.h - 44.0 - 8.0, w: 299.0, h: 44.0 },
                 Orientation::Horizontal,
             ),
             (
@@ -96,15 +105,15 @@ fn main() {
         ];
         for (name, rect, cur) in cases {
             total += 1;
-            let r = snap_to_edge(rect, *work, SNAP_THRESHOLD, cur, icons);
+            let r = snap_to_edge(rect, *work, *monitor, SNAP_THRESHOLD, cur, icons);
             let r = anchor_adjust(rect, r, cur, *work, icons);
-            // 吸附结果必须在本屏内，且不落入其它屏的工作区
-            let in_self = inside(*work, r.x, r.y);
-            let in_other = works
+            // 吸附结果必须在本屏【物理屏幕】内，且不落入其它屏的物理屏幕
+            let in_self = inside(*monitor, r.x, r.y);
+            let in_other = screens
                 .iter()
                 .enumerate()
                 .filter(|(j, _)| *j != i)
-                .any(|(_, o)| inside(*o, r.x, r.y));
+                .any(|(_, (m, _))| inside(*m, r.x, r.y));
             let ok = in_self && !in_other;
             if !ok {
                 fail += 1;
@@ -130,9 +139,9 @@ fn main() {
 
     // ---------- 2) 越界钳制：必须落回本屏工作区 ----------
     println!("\n== 越界钳制验证 ==");
-    for (i, work) in works.iter().enumerate() {
+    for (i, (monitor, work)) in screens.iter().enumerate() {
         total += 1;
-        let (cx, cy) = clamp_to_work_area(work.x - 5000.0, work.y - 5000.0, 299.0, 44.0, *work);
+        let (cx, cy) = clamp_to_work_area(work.x - 5000.0, work.y - 5000.0, 299.0, 44.0, *work, *monitor);
         let ok = inside(*work, cx, cy);
         if !ok {
             fail += 1;
@@ -149,7 +158,7 @@ fn main() {
 
     // ---------- 3) 工作区居中：必须落在本屏 ----------
     println!("\n== 默认居中验证 ==");
-    for (i, work) in works.iter().enumerate() {
+    for (i, (_, work)) in screens.iter().enumerate() {
         total += 1;
         let (cx, cy) = default_center(*work, 299.0, 44.0);
         let ok = inside(*work, cx, cy);
@@ -202,7 +211,7 @@ fn main() {
 
     println!("\n共 {total} 项，失败 {fail} 项");
     if fail == 0 {
-        println!("RESULT=PASS 双屏吸附/钳制/居中 全部落在本屏工作区内");
+        println!("RESULT=PASS 双屏吸附/钳制/居中 全部落在本屏内（贴底停在物理屏底）");
     } else {
         println!("RESULT=FAIL 有 {fail} 项越屏");
     }
