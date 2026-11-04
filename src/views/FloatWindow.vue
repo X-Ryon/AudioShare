@@ -11,6 +11,10 @@
  *   - 麦克风开/闭统一为同一图形，仅颜色 + 斜杠区分
  *   - 整体视觉重设计为 Win11 Fluent 亚克力风格（渐变 + 圆角 + 描边 + 内高光）
  *
+ * 缺陷修复（双屏交界处按钮排列与窗口尺寸脱节）：
+ *   - 布局方向（vertical 类）与窗口尺寸统一经 applyOrientation 原子提交，插值失败自动回滚
+ *   - 吸附评估/旋转/尺寸自适应共用 geomBusy 几何互斥闸，杜绝并发交错改窗口
+ *
  * 追溯：TC-045~048/050~055/059~064（PRD FR-001/009~011/013~020）
  */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
@@ -51,6 +55,21 @@ let ignoreMoveUntil = 0   // 窗口重显/旋转后的噪声抑制截止时间�
 let lastKnownPos: { x: number; y: number } | null = null
 /** 是否仍锚定在默认位置（FR-021）：开启后为 true；用户主动拖动/旋转后为 false */
 let pinnedToDefault = true
+/**
+ * 移动事件被抑制/动画期间吞掉后的待评估标记。
+ * 修复"拖到屏幕边缘释放时尺寸/布局有概率不切换"：吸附动画（90ms）或抑制窗口内
+ * 用户仍可能拖动，这些 onMoved 被吞后若直接丢弃，窗口会停在边缘但保持旧尺寸。
+ * 动画结束出口统一调 maybeSnapAfterSettle() 补一次吸附判定。
+ */
+let pendingSnap = false
+/**
+ * 几何变更互斥闸（吸附评估/旋转/尺寸自适应共用）：布局方向（按钮排列）与窗口尺寸
+ * 必须由同一提交路径原子变更，任何几何操作进行中时其他操作不得入场。
+ * 修复：悬浮窗位于双屏交界处时，防抖评估与动画后补评估并发交错，
+ * 按钮已垂直排列而窗口尺寸未变化（两套触发逻辑分裂）。
+ * JS 单线程下在各函数入口【同步】占闸即可杜绝交错（所有 await 都在占闸之后）。
+ */
+let geomBusy = false
 
 /**
  * 窗口外层位置/内层尺寸 → 逻辑像素（FR-024）。
@@ -104,6 +123,83 @@ function closeFloat() {
 }
 
 /**
+ * 吸附评估（防抖回调与"动画结束补评估"共用）：读当前窗口位置/尺寸 → 后端 snap_float
+ * 计算吸附结果 → 与现状一致时跳过动画（避免动画自身噪声引发多余吸附动画）→
+ * 不一致则 6 步插值切换（含位置/尺寸/布局方向）。返回 true = 已执行吸附动画。
+ */
+async function evaluateSnap(): Promise<boolean> {
+  pendingSnap = false
+  // 【互斥·关键】几何操作（吸附/旋转/尺寸自适应）进行中不得入场：入口同步占闸（所有 await
+  // 都在占闸之后）。否则双屏交界处防抖评估与动画后补评估并发交错，按钮排列与窗口尺寸脱节
+  // （用户反馈：按钮已垂直排列而窗口尺寸未变化）。被拒的评估标记 pendingSnap，
+  // 由动画出口 maybeSnapAfterSettle 补一次判定，不会丢失。
+  if (geomBusy || settling.value || busy.value) {
+    pendingSnap = true
+    return false
+  }
+  geomBusy = true
+  try {
+    const pos = await logicalPos()
+    // 【噪声过滤】位置未发生实质位移的移动事件 = 窗口创建/显示/置顶引发的系统消息，并非用户拖动。
+    // 若不拦截，刚定位到默认位置的窗口会被误吸附到边缘（甚至把垂直布局改回水平）
+    if (lastKnownPos && Math.abs(pos.x - lastKnownPos.x) < 2 && Math.abs(pos.y - lastKnownPos.y) < 2) {
+      logFrontend('info', `忽略位置噪声事件（位置未变）pos=(${pos.x},${pos.y})`)
+      return false
+    }
+    lastKnownPos = { x: pos.x, y: pos.y }
+    // 用户主动拖动 → 不再锚定默认位置
+    pinnedToDefault = false
+    const size = await logicalSize()
+    const r = await invoke<FloatGeometry>('snap_float', {
+      x: pos.x, y: pos.y, w: size.w, h: size.h,
+      iconCount: visiblePids.value.length,
+    })
+    logFrontend('info', `吸附结果 orientation=${r.orientation} pos=(${r.x},${r.y}) size=${r.w}x${r.h}`)
+    const isVert = r.orientation === 'vertical'
+    // 结果与现状几乎一致（方向/位置/尺寸）→ 跳过动画：补评估由动画自身的位置噪声触发时，
+    // 吸附结果就是当前状态，重复动画无意义且会闪烁
+    if (isVert === vertical.value
+      && Math.abs(r.x - pos.x) < 2 && Math.abs(r.y - pos.y) < 2
+      && Math.abs(r.w - size.w) < 2 && Math.abs(r.h - size.h) < 2) {
+      return false
+    }
+    settling.value = true
+    busy.value = true
+    try {
+      // 布局方向（按钮排列）+ 窗口尺寸经 applyOrientation 原子提交（失败自动回滚，不脱节）
+      await applyOrientation(
+        { x: pos.x, y: pos.y, w: size.w, h: size.h, orientation: r.orientation },
+        { x: r.x, y: r.y, w: r.w, h: r.h, orientation: r.orientation },
+      )
+    } finally {
+      settling.value = false
+      busy.value = false
+    }
+    ignoreMoveUntil = Date.now() + 400
+    store.floatOrientation = r.orientation
+    await invoke('save_float_position', { x: r.x, y: r.y, orientation: r.orientation })
+    // 吸附动画期间用户可能又拖动了（事件被 settling 吞掉并标记 pendingSnap）→ 补一次评估
+    maybeSnapAfterSettle()
+    return true
+  } finally {
+    geomBusy = false
+  }
+}
+
+/**
+ * 动画/抑制期间被吞掉的移动事件补偿：延迟 150ms 重新评估吸附（等动画残余噪声平息）。
+ * 修复：拖到屏幕边缘释放时若恰逢吸附动画/抑制窗口，移动事件被吞 →
+ * 窗口停在边缘但布局/尺寸未切换（用户反馈：左侧吸附有概率尺寸不变）。
+ */
+function maybeSnapAfterSettle() {
+  if (!pendingSnap) return
+  clearTimeout(moveTimer)
+  moveTimer = window.setTimeout(() => {
+    void evaluateSnap().catch((e) => logFrontend('warn', `补吸附评估失败: ${e}`))
+  }, 150)
+}
+
+/**
  * 位置/尺寸 6 步插值（约 90ms）：吸附切换与手动旋转共用，消除尺寸跳变
  * 目标位置已含后端以 ⠿ 手柄为锚点的补偿，避免切换时僵硬和窗口错位
  * （逻辑像素口径：setSize/setPosition 用 LogicalSize/LogicalPosition，Tauri 按屏 DPI 换算物理）
@@ -120,6 +216,31 @@ async function animateTo(from: FloatGeometry, to: FloatGeometry) {
       Math.round(from.y + (to.y - from.y) * t),
     ))
     await new Promise((res) => setTimeout(res, 15))
+  }
+}
+
+/**
+ * 布局方向（按钮排列）+ 窗口尺寸的统一提交入口（吸附切换与手动旋转共用）。
+ *
+ * 按钮排列（vertical 类）与窗口尺寸（setSize 插值）在此【原子】提交：同一函数内
+ * 先切按钮再切尺寸，插值失败时回滚按钮排列并把窗口恢复原状——
+ * 修复：双屏交界处动画失败/被并发打断时"按钮垂直排列而窗口尺寸未变化"（两套触发逻辑分裂）。
+ */
+async function applyOrientation(from: FloatGeometry, to: FloatGeometry) {
+  const prev = vertical.value
+  vertical.value = to.orientation === 'vertical'
+  try {
+    await animateTo(from, to)
+  } catch (e) {
+    // 尺寸切换失败 → 回滚布局方向 + 恢复原尺寸/位置，保证按钮排列与窗口尺寸永远一致
+    vertical.value = prev
+    try {
+      await appWindow.setSize(new LogicalSize(Math.round(from.w), Math.round(from.h)))
+      await appWindow.setPosition(new LogicalPosition(Math.round(from.x), Math.round(from.y)))
+    } catch (e2) {
+      logFrontend('warn', `几何回滚失败: ${e2}`)
+    }
+    throw e
   }
 }
 
@@ -158,11 +279,12 @@ async function alignToDefault() {
  */
 async function resizeToContent() {
   // 旋转/吸附正在改尺寸时先等待，避免并发改窗口尺寸（最多等 1s）
-  for (let i = 0; i < 20 && busy.value; i++) {
+  for (let i = 0; i < 20 && (busy.value || geomBusy); i++) {
     await new Promise((res) => setTimeout(res, 50))
   }
-  if (settling.value) return
-  busy.value = true
+  // 与吸附/旋转共用几何互斥闸：占闸后改尺寸，保证读到的 vertical 与窗口实际尺寸一致
+  if (geomBusy || settling.value) return
+  geomBusy = true
   try {
     const n = visiblePids.value.length
     const orient: 'horizontal' | 'vertical' = vertical.value ? 'vertical' : 'horizontal'
@@ -183,6 +305,8 @@ async function resizeToContent() {
     settling.value = false
     ignoreMoveUntil = Date.now() + 600
     logFrontend('info', `悬浮窗尺寸自适应：${orient} 应用数=${n} 尺寸 ${Math.round(tw)}x${Math.round(th)}`)
+    // 尺寸动画期间被吞的移动事件（用户拖动）→ 补一次吸附判定
+    maybeSnapAfterSettle()
     // 宽度变化后居中 x 需重算（FR-021）：仍锚定默认位置时重新对齐
     await alignToDefault()
   } catch (e) {
@@ -190,12 +314,15 @@ async function resizeToContent() {
     logFrontend('warn', `悬浮窗尺寸自适应失败: ${e}`)
   } finally {
     busy.value = false
+    geomBusy = false
   }
 }
 
 /** ⟳ 手动旋转布局（FR-016）：水平 ⇄ 垂直，锚点 = ⠿ 手柄中心 */
 async function rotateLayout(e?: MouseEvent) {
-  if (busy.value || settling.value) return
+  // 与吸附评估共用几何互斥闸：入口同步占闸，避免与吸附动画交错改窗口（按钮/尺寸脱节）
+  if (geomBusy || busy.value || settling.value) return
+  geomBusy = true
   busy.value = true
   spinning.value = true
   window.setTimeout(() => { spinning.value = false }, 280)
@@ -210,8 +337,8 @@ async function rotateLayout(e?: MouseEvent) {
       iconCount: visiblePids.value.length,
     })
     settling.value = true
-    vertical.value = r.orientation === 'vertical'
-    await animateTo(
+    // 布局方向（按钮排列）+ 窗口尺寸经 applyOrientation 原子提交（失败自动回滚，不脱节）
+    await applyOrientation(
       { x: pos.x, y: pos.y, w: size.w, h: size.h, orientation: r.orientation },
       { x: r.x, y: r.y, w: r.w, h: r.h, orientation: r.orientation },
     )
@@ -224,11 +351,14 @@ async function rotateLayout(e?: MouseEvent) {
     store.floatOrientation = r.orientation
     await invoke('save_float_position', { x: r.x, y: r.y, orientation: r.orientation })
     logFrontend('info', `悬浮窗旋转为 ${r.orientation}，位置 (${r.x}, ${r.y}) 尺寸 ${r.w}x${r.h}`)
+    // 旋转动画期间被吞的移动事件（用户拖动）→ 补一次吸附判定
+    maybeSnapAfterSettle()
   } catch (e) {
     settling.value = false
     logFrontend('warn', `旋转布局失败: ${e}`)
   } finally {
     busy.value = false
+    geomBusy = false
   }
 }
 
@@ -254,14 +384,28 @@ onMounted(async () => {
 
   // 拖动（原生 drag-region）结束后 200ms 防抖吸附：后端纯函数计算，前端执行位置/尺寸切换
   await appWindow.onMoved(async () => {
-    if (Date.now() < ignoreMoveUntil) return
-    // 首次事件是窗口显示/创建期的移动噪声（此时并未拖动），
-    // 若不忽略会触发一次误吸附，把悬浮窗吸到屏幕边缘并切换布局
-    if (!movedOnce.value) {
-      movedOnce.value = true
+    if (unmounted) return
+    // 抑制窗口内到达的移动事件：可能是用户拖动（如吸附动画刚结束时连续调整位置），
+    // 不能直接丢弃——标记待评估，动画结束后由 maybeSnapAfterSettle 补一次吸附判定，
+    // 否则窗口会停在屏幕边缘但布局/尺寸未切换（用户反馈：左边缘吸附有概率尺寸不变）
+    if (Date.now() < ignoreMoveUntil) {
+      pendingSnap = true
       return
     }
-    if (settling.value || busy.value || unmounted) return
+    // 首个事件：位置与初始位置几乎相同 = 窗口显示/创建期的移动噪声（此时并未拖动），
+    // 若不忽略会触发一次误吸附，把悬浮窗吸到屏幕边缘并切换布局。
+    // 但位置明显变化的首个事件是真实拖动的首事件（快速甩动可能只产生一个事件），不能吞
+    if (!movedOnce.value) {
+      movedOnce.value = true
+      const p = await logicalPos()
+      if (lastKnownPos && Math.abs(p.x - lastKnownPos.x) < 2 && Math.abs(p.y - lastKnownPos.y) < 2) {
+        return
+      }
+    }
+    if (settling.value || busy.value) {
+      pendingSnap = true
+      return
+    }
     clearTimeout(moveTimer)
     moveTimer = window.setTimeout(async () => {
       try {
@@ -269,37 +413,17 @@ onMounted(async () => {
         // 开启定位（show/create）触发的 onMoved 可能在 float_window_shown 广播【之前】就到达，
         // 若只在回调入口检查一次，延迟 200ms 后仍会执行一次误吸附
         //（默认位置 y=0 属"贴顶"，误吸附会把用户的垂直布局改成水平）
-        if (Date.now() < ignoreMoveUntil) return
-        const pos = await logicalPos()
-        // 【噪声过滤】位置未发生实质位移的移动事件 = 窗口创建/显示/置顶引发的系统消息，并非用户拖动。
-        // 若不拦截，刚定位到默认位置的窗口会被误吸附到边缘（甚至把垂直布局改回水平）
-        if (lastKnownPos && Math.abs(pos.x - lastKnownPos.x) < 2 && Math.abs(pos.y - lastKnownPos.y) < 2) {
-          logFrontend('info', `忽略位置噪声事件（位置未变）pos=(${pos.x},${pos.y})`)
+        if (Date.now() < ignoreMoveUntil) {
+          pendingSnap = true
           return
         }
-        lastKnownPos = { x: pos.x, y: pos.y }
-        // 用户主动拖动 → 不再锚定默认位置
-        pinnedToDefault = false
-        const size = await logicalSize()
-        const r = await invoke<FloatGeometry>('snap_float', {
-          x: pos.x, y: pos.y, w: size.w, h: size.h,
-          iconCount: visiblePids.value.length,
-        })
-        logFrontend('info', `吸附结果 orientation=${r.orientation} pos=(${r.x},${r.y}) size=${r.w}x${r.h}`)
-        settling.value = true
-        const isVert = r.orientation === 'vertical'
-        vertical.value = isVert
-        // 目标尺寸由后端随 SnapResult 返回（w/h），前端不再硬编码 [232,44]/[44,232]
-        await animateTo(
-          { x: pos.x, y: pos.y, w: size.w, h: size.h, orientation: r.orientation },
-          { x: r.x, y: r.y, w: r.w, h: r.h, orientation: r.orientation },
-        )
-        settling.value = false
-        ignoreMoveUntil = Date.now() + 400
-        store.floatOrientation = r.orientation
-        await invoke('save_float_position', { x: r.x, y: r.y, orientation: r.orientation })
+        // 防抖等待期间旋转/尺寸自适应动画可能已开始 → 不并发改窗口尺寸，交补评估处理
+        if (settling.value || busy.value) {
+          pendingSnap = true
+          return
+        }
+        await evaluateSnap()
       } catch (e) {
-        settling.value = false
         logFrontend('warn', `边缘吸附失败: ${e}`)
       }
     }, 200)
