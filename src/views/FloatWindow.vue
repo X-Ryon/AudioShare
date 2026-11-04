@@ -47,9 +47,13 @@ const icons = ref(new Map<number, string>()) // pid -> base64 data URL
 let moveTimer: number | undefined
 let unmounted = false
 let ignoreMoveUntil = 0   // 窗口重显/旋转后的噪声抑制截止时间戳
+/** 上一次已知的窗口位置（外层，物理像素）：用于识别"位置未变的移动事件"（系统噪声） */
+let lastKnownPos: { x: number; y: number } | null = null
+/** 是否仍锚定在默认位置（FR-021）：开启后为 true；用户主动拖动/旋转后为 false */
+let pinnedToDefault = true
 
 const pids = computed(() => [...store.selected])
-// 图标区固定宽度（3×20 + 2×4 = 68），超出部分裁切，避免撑破窗口
+// 图标区固定最多显示 3 个应用（水平/垂直一致，保证窗口尺寸上限可控）
 const visiblePids = computed(() => pids.value.slice(0, MAX_VISIBLE_ICONS))
 
 function nameOf(pid: number): string {
@@ -68,7 +72,7 @@ async function loadIcons() {
   }
 }
 
-watch(pids, () => { void loadIcons() })
+watch(pids, () => { void loadIcons(); void resizeToContent() })
 
 function pauseLocal() {
   invoke('media_play_pause').catch((e) => logFrontend('warn', `media_play_pause 失败: ${e}`))
@@ -102,6 +106,76 @@ async function animateTo(from: FloatGeometry, to: FloatGeometry) {
   }
 }
 
+/**
+ * 对齐到后端计算的默认位置（FR-021：所在屏幕水平居中 + 顶端吸附）
+ *
+ * 仅在"用户尚未主动移动过"（pinnedToDefault）时生效。
+ * 必要性：① 建窗时 builder.position() 在 Windows 上不生效，窗口会创建在光标处；
+ *          ② 共享应用数变化导致宽度变化，居中 x 需重算。
+ * 单一真源在后端 float_default_position（按当前工作区 + 当前窗口宽计算）。
+ */
+async function alignToDefault() {
+  if (!pinnedToDefault || unmounted) return
+  try {
+    const [dx, dy] = await invoke<[number, number]>('float_default_position')
+    const pos = await appWindow.outerPosition()
+    if (Math.abs(pos.x - dx) < 1 && Math.abs(pos.y - dy) < 1) {
+      lastKnownPos = { x: pos.x, y: pos.y }
+      return
+    }
+    await appWindow.setPosition(new PhysicalPosition(Math.round(dx), Math.round(dy)))
+    lastKnownPos = { x: Math.round(dx), y: Math.round(dy) }
+    ignoreMoveUntil = Date.now() + 600
+    logFrontend('info', `悬浮窗对齐默认位置 (${Math.round(dx)},${Math.round(dy)})`)
+  } catch (e) {
+    logFrontend('warn', `对齐默认位置失败: ${e}`)
+  }
+}
+
+/**
+ * 窗口尺寸随共享应用数自适应（内容驱动）
+ *
+ * 尺寸口径单一真源在后端：target_size(direction, icon_count) = 基础尺寸 + 图标区跨度。
+ * 前端只负责把【当前应用数】报给后端取目标尺寸，并做 6 步过渡；
+ * 尺寸变化时保持 ⠿ 手柄锚点（水平态保持左缘 x，垂直态保持上缘 y），最后 clamp 回工作区。
+ */
+async function resizeToContent() {
+  // 旋转/吸附正在改尺寸时先等待，避免并发改窗口尺寸（最多等 1s）
+  for (let i = 0; i < 20 && busy.value; i++) {
+    await new Promise((res) => setTimeout(res, 50))
+  }
+  if (settling.value) return
+  busy.value = true
+  try {
+    const n = visiblePids.value.length
+    const orient: 'horizontal' | 'vertical' = vertical.value ? 'vertical' : 'horizontal'
+    const [tw, th] = await invoke<[number, number]>('float_target_size', { orientation: orient, iconCount: n })
+    const size = await appWindow.innerSize()
+    if (Math.round(size.width) === Math.round(tw) && Math.round(size.height) === Math.round(th)) return
+    const pos = await appWindow.outerPosition()
+    settling.value = true
+    await animateTo(
+      { x: pos.x, y: pos.y, w: size.width, h: size.height, orientation: orient },
+      { x: pos.x, y: pos.y, w: tw, h: th, orientation: orient },
+    )
+    // 变宽/变高后可能超出工作区 → 拉回
+    const [cx, cy] = await invoke<[number, number]>('fit_float_position', { x: pos.x, y: pos.y, w: tw, h: th })
+    if (Math.round(cx) !== Math.round(pos.x) || Math.round(cy) !== Math.round(pos.y)) {
+      await appWindow.setPosition(new PhysicalPosition(Math.round(cx), Math.round(cy)))
+    }
+    settling.value = false
+    ignoreMoveUntil = Date.now() + 600
+    logFrontend('info', `悬浮窗尺寸自适应：${orient} 应用数=${n} 尺寸 ${Math.round(tw)}x${Math.round(th)}`)
+    // 宽度变化后居中 x 需重算（FR-021）：仍锚定默认位置时重新对齐
+    await alignToDefault()
+  } catch (e) {
+    settling.value = false
+    logFrontend('warn', `悬浮窗尺寸自适应失败: ${e}`)
+  } finally {
+    busy.value = false
+  }
+}
+
 /** ⟳ 手动旋转布局（FR-016）：水平 ⇄ 垂直，锚点 = ⠿ 手柄中心 */
 async function rotateLayout(e?: MouseEvent) {
   if (busy.value || settling.value) return
@@ -115,6 +189,7 @@ async function rotateLayout(e?: MouseEvent) {
     const size = await appWindow.innerSize()
     const r = await invoke<FloatGeometry>('rotate_float', {
       x: pos.x, y: pos.y, w: size.width, h: size.height,
+      iconCount: visiblePids.value.length,
     })
     settling.value = true
     vertical.value = r.orientation === 'vertical'
@@ -125,6 +200,9 @@ async function rotateLayout(e?: MouseEvent) {
     settling.value = false
     // 旋转动画本身会连续触发 onMoved，抑制一段时间，避免"旋转后立刻被吸附规则改回"
     ignoreMoveUntil = Date.now() + 800
+    // 用户主动旋转 → 位置按手柄锚点补偿，不再锚定默认位置
+    pinnedToDefault = false
+    lastKnownPos = { x: r.x, y: r.y }
     store.floatOrientation = r.orientation
     await invoke('save_float_position', { x: r.x, y: r.y, orientation: r.orientation })
     logFrontend('info', `悬浮窗旋转为 ${r.orientation}，位置 (${r.x}, ${r.y}) 尺寸 ${r.w}x${r.h}`)
@@ -141,6 +219,15 @@ onMounted(async () => {
 
   // 启动时按落盘的 orientation 恢复布局方向（后端建窗已用对应尺寸）
   vertical.value = store.floatOrientation === 'vertical'
+  // 建窗/加载期的移动事件均为系统噪声，延长抑制窗口
+  ignoreMoveUntil = Date.now() + 1500
+  // 记录初始位置基准（用于识别"位置未变的移动事件"）
+  try {
+    const p0 = await appWindow.outerPosition()
+    lastKnownPos = { x: p0.x, y: p0.y }
+  } catch (e) {
+    logFrontend('warn', `读取初始位置失败: ${e}`)
+  }
 
   // 后端重显悬浮窗时广播：此后短时间内的 onMoved 是位置噪声，忽略以免误吸附
   await listen('float_window_shown', () => {
@@ -160,11 +247,25 @@ onMounted(async () => {
     clearTimeout(moveTimer)
     moveTimer = window.setTimeout(async () => {
       try {
+        // 【时序关键】必须在防抖回调内【再】检查一次抑制窗口：
+        // 开启定位（show/create）触发的 onMoved 可能在 float_window_shown 广播【之前】就到达，
+        // 若只在回调入口检查一次，延迟 200ms 后仍会执行一次误吸附
+        //（默认位置 y=0 属"贴顶"，误吸附会把用户的垂直布局改成水平）
+        if (Date.now() < ignoreMoveUntil) return
         const pos = await appWindow.outerPosition()
-        // 尺寸用【内层】尺寸（与 setSize 语义一致），位置用【外层】位置
+        // 【噪声过滤】位置未发生实质位移的移动事件 = 窗口创建/显示/置顶引发的系统消息，并非用户拖动。
+        // 若不拦截，刚定位到默认位置的窗口会被误吸附到边缘（甚至把垂直布局改回水平）
+        if (lastKnownPos && Math.abs(pos.x - lastKnownPos.x) < 2 && Math.abs(pos.y - lastKnownPos.y) < 2) {
+          logFrontend('info', `忽略位置噪声事件（位置未变）pos=(${pos.x},${pos.y})`)
+          return
+        }
+        lastKnownPos = { x: pos.x, y: pos.y }
+        // 用户主动拖动 → 不再锚定默认位置
+        pinnedToDefault = false
         const size = await appWindow.innerSize()
         const r = await invoke<FloatGeometry>('snap_float', {
           x: pos.x, y: pos.y, w: size.width, h: size.height,
+          iconCount: visiblePids.value.length,
         })
         logFrontend('info', `吸附结果 orientation=${r.orientation} pos=(${r.x},${r.y}) size=${r.w}x${r.h}`)
         settling.value = true
@@ -187,6 +288,12 @@ onMounted(async () => {
   })
 
   void loadIcons()
+  // 初始尺寸修正：后端建窗时用【基础尺寸】（图标区为空），
+  // 前端拿到真实共享列表后按实际应用数调整为目标尺寸
+  await resizeToContent()
+  // 【FR-021】开启即对齐默认位置（水平居中 + 顶端吸附），
+  // 不受"建窗时 position() 未生效 / 前端挂载早于后端定位"的时序影响
+  await alignToDefault()
 })
 
 onBeforeUnmount(() => {
@@ -312,12 +419,12 @@ html, body, #app { background: transparent; }
 .switch.on::after { transform: translateX(12px); background: #fff; }
 .float.vertical .switch { margin-right: 0; margin-bottom: 6px; }
 
-/* ===== 应用图标区（固定 3 个 = 68px） ===== */
+/* ===== 应用图标区（宽度由内容自适应：0 个 → 0px，最多 3 个 → 68px） ===== */
 .icons {
   display: flex; align-items: center; gap: 4px;
-  width: 68px; flex-shrink: 0; overflow: hidden; margin-right: 6px;
+  flex-shrink: 0; overflow: hidden; margin-right: 6px;
 }
-.float.vertical .icons { flex-direction: column; width: 20px; height: 68px; margin-right: 0; margin-bottom: 6px; }
+.float.vertical .icons { flex-direction: column; width: 20px; height: auto; margin-right: 0; margin-bottom: 6px; }
 .app-ico {
   width: 20px; height: 20px; border-radius: 5px; flex-shrink: 0; overflow: hidden;
   display: flex; align-items: center; justify-content: center;
