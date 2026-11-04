@@ -59,7 +59,7 @@ fn migrate_legacy_data_dir<R: tauri::Runtime>(m: &impl Manager<R>) {
     if new_dir.exists() {
         return;
     }
-    for legacy in ["com.xryon.audioshare", "com.xryon.audioshare"] {
+    for legacy in ["com.xryon.audioshare"] {
         let old = cfg.join(legacy);
         if old.exists() {
             let _ = std::fs::rename(&old, &new_dir);
